@@ -1,0 +1,82 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Cache folders (all studies and tests)
+**/cache/
+cache/
+
+# Logs
+**/logs/
+logs/
+*.log
+
+# Exports
+**/exports/
+exports/
+
+# Data folders - ignore everything in data folders
+**/data/*
+# But keep README files to preserve folder structure
+!**/data/README.*
+!**/data/README.txt
+!**/data/.gitkeep
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*~
+
+# Coverage reports
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+

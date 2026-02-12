@@ -1,0 +1,17 @@
+# Development Configuration
+# Overrides base.yaml for faster development/testing
+
+# Smaller dataset for faster processing
+data:
+  sample_size: 50  # Reduced from 100
+
+# Simplified processing for development
+processing:
+  method: "simple"
+  transformations:
+    - "normalize"  # Only one transformation
+
+# Faster visualization settings
+visualization:
+  width: 600
+  height: 400

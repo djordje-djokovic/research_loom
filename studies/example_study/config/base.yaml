@@ -1,0 +1,46 @@
+# Base Configuration for Example Study
+# This demonstrates all configuration features of the Research Loom framework
+
+study:
+  name: "example_study"
+  description: "A comprehensive example study demonstrating all Research Loom framework features"
+  version: "1.0.0"
+
+# Data loading configuration
+# This section is used by the "raw_data" node (config_section="data")
+data:
+  source: "sample_data"
+  sample_size: 100  # Number of rows to generate
+
+# Processing configuration
+# This section is used by the "processed_dataframe" node (config_section="processing")
+processing:
+  method: "standard"
+  include_interactions: true
+  transformations:
+    - "normalize"
+    - "standardize"
+
+# Statistics configuration
+# This section is used by the "statistics" node (config_section="statistics")
+statistics:
+  calculate_descriptive: true
+  calculate_by_category: true
+  confidence_level: 0.95
+
+# Visualization configuration
+# This section is used by the "visualization" node (config_section="visualization")
+visualization:
+  output_dir: "exports/plots"
+  formats: ["html"]  # Plotly figures are stored as HTML
+  theme: "plotly_dark"
+  width: 800
+  height: 600
+
+# Report configuration
+# This section is used by the "report" node (config_section="report")
+report:
+  output_format: "json"
+  include_statistics: true
+  include_visualization: true
+  include_data_summary: true
