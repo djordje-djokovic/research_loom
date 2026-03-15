@@ -73,6 +73,7 @@ desktop.ini
 htmlcov/
 .pytest_cache/
 .tox/
+tests/.artifacts/
 
 # Virtual environments
 venv/
