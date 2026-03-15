@@ -210,25 +210,6 @@ class ResearchPipeline:
             return True
         return False
     
-    def _looks_like_uniform_rows(self, val) -> bool:
-        """Check if value looks like uniform rows (list of dicts)"""
-        if not isinstance(val, list) or len(val) < 100:  # threshold for parquet
-            return False
-        if not all(isinstance(item, dict) for item in val[:10]):  # sample check
-            return False
-        # Check if keys are mostly uniform
-        sample_keys = [set(item.keys()) for item in val[:10]]
-        if not all(keys == sample_keys[0] for keys in sample_keys):
-            return False
-        # Check if values are flat (not nested structures) - if nested, don't treat as tabular
-        # Sample a few items to check for nested dicts/lists
-        for item in val[:5]:  # Check first 5 items
-            for key, value in item.items():
-                # If any value is a dict or list, this is nested data, not tabular
-                if isinstance(value, (dict, list)):
-                    return False
-        return True
-    
     def _is_large_nested(self, val) -> bool:
         """Check if value is a large nested dict"""
         if not isinstance(val, dict):
@@ -258,6 +239,115 @@ class ResearchPipeline:
         }
         ptr.update(hints)
         return ptr
+
+    def _inject_dark_plotly_theme(self, html_content: str) -> str:
+        """Inject dark background CSS/JS into Plotly HTML."""
+        css_code = """
+<style>
+    html, body {
+        background-color: #101010 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+    body > div {
+        background-color: #101010 !important;
+    }
+</style>
+"""
+        if "</head>" in html_content:
+            html_content = html_content.replace("</head>", css_code + "</head>")
+        else:
+            html_content = html_content.replace("<body>", "<head>" + css_code + "</head><body>")
+
+        js_code = """
+<script>
+    document.body.style.backgroundColor = "#101010";
+    if (document.body.parentElement) {
+        document.body.parentElement.style.backgroundColor = "#101010";
+    }
+</script>
+"""
+        return html_content.replace("</body>", js_code + "</body>")
+
+    def _write_plotly_html_with_dark_theme(self, fig, path: Path) -> None:
+        """Write Plotly HTML and apply dark theme styling."""
+        fig.write_html(str(path))
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                html_content = f.read()
+            themed = self._inject_dark_plotly_theme(html_content)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(themed)
+        except Exception as e:
+            self.logger.warning(f"Could not inject dark background styles: {e}")
+
+    def _save_json_zst_payload(self, val: Any, path: Path, key: str) -> None:
+        """Serialize/compress JSON payload to .json.zst."""
+        self.logger.info(f"[PHASE: SAVE] Starting json.zst save for {key}")
+        try:
+            self.logger.info(f"[PHASE: SAVE] Serializing {key} to JSON string...")
+            json_str = json.dumps(val, default=str)
+            json_bytes = json_str.encode("utf-8")
+            self.logger.info(f"[PHASE: SAVE] JSON serialization successful: {len(json_bytes)} bytes")
+        except TypeError as e:
+            self.logger.error(f"[PHASE: SAVE] JSON serialization TypeError for {key}: {e}")
+            self.logger.error(f"[PHASE: SAVE] Error type: {type(e).__name__}, args: {e.args}")
+            raise
+        except ValueError as e:
+            self.logger.error(f"[PHASE: SAVE] JSON serialization ValueError for {key}: {e}")
+            self.logger.error(f"[PHASE: SAVE] Error type: {type(e).__name__}, args: {e.args}")
+            raise
+        except MemoryError as e:
+            self.logger.error(f"[PHASE: SAVE] MemoryError during JSON serialization for {key}: {e}")
+            self.logger.error(
+                f"[PHASE: SAVE] Data too large to serialize in memory. Size estimate: {len(str(val)) if hasattr(val, '__len__') else 'N/A'}"
+            )
+            raise
+        except Exception as e:
+            self.logger.error(f"[PHASE: SAVE] JSON serialization error for {key}: {type(e).__name__}: {e}")
+            self.logger.error(f"[PHASE: SAVE] Error args: {e.args}")
+            raise
+
+        try:
+            self.logger.info(f"[PHASE: SAVE] Compressing and writing {key} to {path}...")
+            with open(path, "wb") as f:
+                cctx = zstd.ZstdCompressor()
+                compressed = cctx.compress(json_bytes)
+                f.write(compressed)
+            self.logger.info(
+                f"[PHASE: SAVE] Successfully saved {key} as json.zst: {len(compressed)} bytes compressed from {len(json_bytes)} bytes"
+            )
+        except IOError as e:
+            self.logger.error(f"[PHASE: SAVE] IOError saving {key} as json.zst to {path}: {e}")
+            self.logger.error(f"[PHASE: SAVE] Error type: {type(e).__name__}, errno: {getattr(e, 'errno', 'N/A')}")
+            raise
+        except MemoryError as e:
+            self.logger.error(f"[PHASE: SAVE] MemoryError during compression/write for {key}: {e}")
+            raise
+        except Exception as e:
+            self.logger.error(f"[PHASE: SAVE] Error compressing/writing {key} as json.zst: {type(e).__name__}: {e}")
+            self.logger.error(f"[PHASE: SAVE] Error args: {e.args}")
+            raise
+
+    def _save_jsonl_zst_payload(self, val: Any, path: Path, key: str) -> None:
+        """Serialize/compress JSON lines payload to .jsonl.zst."""
+        self.logger.info(f"[PHASE: SAVE] Starting jsonl.zst save for {key} (streaming, {len(val)} items)")
+        try:
+            cctx = zstd.ZstdCompressor()
+            item_count = 0
+            with open(path, "wb") as f, cctx.stream_writer(f) as writer:
+                for item in val:
+                    writer.write((json.dumps(item, default=str) + "\n").encode())
+                    item_count += 1
+                    if item_count % 1000 == 0:
+                        self.logger.debug(f"[PHASE: SAVE] Written {item_count}/{len(val)} items to jsonl.zst")
+            self.logger.info(f"[PHASE: SAVE] Successfully saved {key} as jsonl.zst: {item_count} items")
+        except MemoryError as e:
+            self.logger.error(f"[PHASE: SAVE] MemoryError during jsonl.zst streaming for {key}: {e}")
+            raise
+        except Exception as e:
+            self.logger.error(f"[PHASE: SAVE] Error writing jsonl.zst for {key}: {type(e).__name__}: {e}")
+            raise
     
     def _spill_with_format(self, val: Any, artifacts_dir: Path, stem: str, key: str, format: str) -> Any:
         """Spill a value to artifacts with a specific format"""
@@ -284,72 +374,14 @@ class ResearchPipeline:
             elif format == "json.zst":
                 if not HAS_ZSTD:
                     raise ValueError("JSON.zst format requires zstandard")
-                self.logger.info(f"[PHASE: SAVE] Starting json.zst save for {key}")
-                try:
-                    # Test JSON serialization first with detailed error reporting
-                    # Note: json is already imported at module level
-                    self.logger.info(f"[PHASE: SAVE] Serializing {key} to JSON string...")
-                    json_str = json.dumps(val, default=str)
-                    json_bytes = json_str.encode('utf-8')
-                    self.logger.info(f"[PHASE: SAVE] JSON serialization successful: {len(json_bytes)} bytes")
-                except TypeError as e:
-                    self.logger.error(f"[PHASE: SAVE] JSON serialization TypeError for {key}: {e}")
-                    self.logger.error(f"[PHASE: SAVE] Error type: {type(e).__name__}, args: {e.args}")
-                    raise
-                except ValueError as e:
-                    self.logger.error(f"[PHASE: SAVE] JSON serialization ValueError for {key}: {e}")
-                    self.logger.error(f"[PHASE: SAVE] Error type: {type(e).__name__}, args: {e.args}")
-                    raise
-                except MemoryError as e:
-                    self.logger.error(f"[PHASE: SAVE] MemoryError during JSON serialization for {key}: {e}")
-                    self.logger.error(f"[PHASE: SAVE] Data too large to serialize in memory. Size estimate: {len(str(val)) if hasattr(val, '__len__') else 'N/A'}")
-                    raise
-                except Exception as e:
-                    self.logger.error(f"[PHASE: SAVE] JSON serialization error for {key}: {type(e).__name__}: {e}")
-                    self.logger.error(f"[PHASE: SAVE] Error args: {e.args}")
-                    raise
-                
-                try:
-                    self.logger.info(f"[PHASE: SAVE] Compressing and writing {key} to {path}...")
-                    with open(path, 'wb') as f:
-                        cctx = zstd.ZstdCompressor()
-                        compressed = cctx.compress(json_bytes)
-                        f.write(compressed)
-                    self.logger.info(f"[PHASE: SAVE] Successfully saved {key} as json.zst: {len(compressed)} bytes compressed from {len(json_bytes)} bytes")
-                except IOError as e:
-                    self.logger.error(f"[PHASE: SAVE] IOError saving {key} as json.zst to {path}: {e}")
-                    self.logger.error(f"[PHASE: SAVE] Error type: {type(e).__name__}, errno: {getattr(e, 'errno', 'N/A')}")
-                    raise
-                except MemoryError as e:
-                    self.logger.error(f"[PHASE: SAVE] MemoryError during compression/write for {key}: {e}")
-                    raise
-                except Exception as e:
-                    self.logger.error(f"[PHASE: SAVE] Error compressing/writing {key} as json.zst: {type(e).__name__}: {e}")
-                    self.logger.error(f"[PHASE: SAVE] Error args: {e.args}")
-                    raise
+                self._save_json_zst_payload(val, path, key)
                     
             elif format == "jsonl.zst":
                 if not HAS_ZSTD:
                     raise ValueError("JSONL.zst format requires zstandard")
                 if not isinstance(val, list):
                     raise ValueError("JSONL.zst format requires a list")
-                self.logger.info(f"[PHASE: SAVE] Starting jsonl.zst save for {key} (streaming, {len(val)} items)")
-                try:
-                    cctx = zstd.ZstdCompressor()
-                    item_count = 0
-                    with open(path, 'wb') as f, cctx.stream_writer(f) as writer:
-                        for item in val:
-                            writer.write((json.dumps(item, default=str) + '\n').encode())
-                            item_count += 1
-                            if item_count % 1000 == 0:
-                                self.logger.debug(f"[PHASE: SAVE] Written {item_count}/{len(val)} items to jsonl.zst")
-                    self.logger.info(f"[PHASE: SAVE] Successfully saved {key} as jsonl.zst: {item_count} items")
-                except MemoryError as e:
-                    self.logger.error(f"[PHASE: SAVE] MemoryError during jsonl.zst streaming for {key}: {e}")
-                    raise
-                except Exception as e:
-                    self.logger.error(f"[PHASE: SAVE] Error writing jsonl.zst for {key}: {type(e).__name__}: {e}")
-                    raise
+                self._save_jsonl_zst_payload(val, path, key)
                         
             elif format == "json":
                 with open(path, 'w') as f:
@@ -377,48 +409,7 @@ class ResearchPipeline:
                     
             elif format == "html":
                 if HAS_PLOTLY and isinstance(val, go.Figure):
-                    val.write_html(str(path))
-                    # Inject dark background CSS and JavaScript for Plotly figures
-                    try:
-                        with open(path, 'r', encoding='utf-8') as f:
-                            html_content = f.read()
-                        
-                        # Add CSS in <head> to set dark background and remove margins
-                        css_code = """
-<style>
-    html, body {
-        background-color: #101010 !important;
-        margin: 0 !important;
-        padding: 0 !important;
-    }
-    body > div {
-        background-color: #101010 !important;
-    }
-</style>
-"""
-                        # Inject CSS before </head>
-                        if "</head>" in html_content:
-                            html_content = html_content.replace("</head>", css_code + "</head>")
-                        else:
-                            # Fallback: inject at start of <body>
-                            html_content = html_content.replace("<body>", "<head>" + css_code + "</head><body>")
-                        
-                        # Add JavaScript as fallback (runs after page load)
-                        js_code = """
-<script>
-    document.body.style.backgroundColor = "#101010";
-    if (document.body.parentElement) {
-        document.body.parentElement.style.backgroundColor = "#101010";
-    }
-</script>
-"""
-                        html_content = html_content.replace("</body>", js_code + "</body>")
-                        
-                        with open(path, 'w', encoding='utf-8') as f:
-                            f.write(html_content)
-                    except Exception as e:
-                        # If injection fails, continue anyway (HTML is still valid)
-                        self.logger.warning(f"Could not inject dark background styles: {e}")
+                    self._write_plotly_html_with_dark_theme(val, path)
                 else:
                     raise ValueError(f"Cannot convert {type(val)} to HTML")
                     
@@ -484,48 +475,7 @@ class ResearchPipeline:
                 return self._artifact_ptr("png", self.cache_dir, path, key)
             except Exception:
                 html_path = artifacts_dir / f"{stem}.html"
-                val.write_html(str(html_path))
-                # Inject dark background CSS and JavaScript for Plotly figures
-                try:
-                    with open(html_path, 'r', encoding='utf-8') as f:
-                        html_content = f.read()
-                    
-                    # Add CSS in <head> to set dark background and remove margins
-                    css_code = """
-<style>
-    html, body {
-        background-color: #101010 !important;
-        margin: 0 !important;
-        padding: 0 !important;
-    }
-    body > div {
-        background-color: #101010 !important;
-    }
-</style>
-"""
-                    # Inject CSS before </head>
-                    if "</head>" in html_content:
-                        html_content = html_content.replace("</head>", css_code + "</head>")
-                    else:
-                        # Fallback: inject at start of <body>
-                        html_content = html_content.replace("<body>", "<head>" + css_code + "</head><body>")
-                    
-                    # Add JavaScript as fallback (runs after page load)
-                    js_code = """
-<script>
-    document.body.style.backgroundColor = "#101010";
-    if (document.body.parentElement) {
-        document.body.parentElement.style.backgroundColor = "#101010";
-    }
-</script>
-"""
-                    html_content = html_content.replace("</body>", js_code + "</body>")
-                    
-                    with open(html_path, 'w', encoding='utf-8') as f:
-                        f.write(html_content)
-                except Exception as e:
-                    # If injection fails, continue anyway (HTML is still valid)
-                    self.logger.warning(f"Could not inject dark background styles: {e}")
+                self._write_plotly_html_with_dark_theme(val, html_path)
                 return self._artifact_ptr("html", self.cache_dir, html_path, key)
         
         # Tabular → Parquet (only for explicit DataFrames/Arrow, not auto-detected list-of-dicts)
@@ -668,11 +618,11 @@ class ResearchPipeline:
         if not cache_path.exists():
             return False
         try:
-            # Lightweight sanity: file is non-empty and readable
-            with open(cache_path, "rb") as f:
-                first_byte = f.read(1)
-            if not first_byte:
-                # Empty / truncated file – treat as invalid
+            # Validate cache is parseable JSON to avoid treating corrupted
+            # non-empty files as valid cache entries.
+            with open(cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
                 return False
             return True
         except Exception:
@@ -695,16 +645,6 @@ class ResearchPipeline:
                 return data["_result"]  # Return as-is (may contain artifact pointers)
             # Handle old format
             return data
-    
-    def _has_artifacts(self, obj) -> bool:
-        """Check if object contains artifact pointers"""
-        if isinstance(obj, dict):
-            if obj.get("__artifact__"):
-                return True
-            return any(self._has_artifacts(v) for v in obj.values())
-        elif isinstance(obj, (list, tuple)):
-            return any(self._has_artifacts(item) for item in obj)
-        return False
     
     def save_cache(self, node_name: str, cache_key: str, result: Any, config: Dict = None):
         """Save result to cache atomically with provenance metadata and file locking"""
@@ -949,6 +889,92 @@ class ResearchPipeline:
         self._mark_recent(node_name, cache_key)
         self.logger.info(f"    {node_name}: [SAVED TO CACHE] - Result cached for future use ({dt:.3f}s)")
         return self.load_cache(node_name, cache_key)
+
+    def _resolve_outputs_for_run(
+        self,
+        config: Dict,
+        materialize: Union[str, Sequence[str]],
+    ) -> tuple[List[str], List[str]]:
+        """Resolve outputs and auto-computed outputs for this run."""
+        outputs = self._resolve_materialize_set(materialize)
+        auto_computed_outputs: List[str] = []
+
+        if outputs:
+            return outputs, auto_computed_outputs
+
+        # If user explicitly requested unknown target list, do no work.
+        if isinstance(materialize, (list, tuple, set)) and len(materialize) > 0:
+            return [], auto_computed_outputs
+
+        default_outputs = self._default_outputs()
+        if not default_outputs:
+            return [], auto_computed_outputs
+
+        invalid_defaults = []
+        for node_name in default_outputs:
+            cache_key = self.get_node_cache_key(config, node_name)
+            if not self.is_cache_valid(node_name, cache_key):
+                invalid_defaults.append(node_name)
+
+        if invalid_defaults:
+            outputs = invalid_defaults
+            auto_computed_outputs = invalid_defaults
+
+        return outputs, auto_computed_outputs
+
+    def _load_node_from_cache(self, config: Dict, node_name: str):
+        """Load one node from cache and mark it recent."""
+        key = self.get_node_cache_key(config, node_name)
+        value = self.load_cache(node_name, key)
+        self._mark_recent(node_name, key)
+        return value
+
+    def _log_execution_plan(self, config: Dict, execution_plan: Dict[str, str]) -> None:
+        """Log execution plan details."""
+        self.logger.info("\nEXECUTION PLAN:")
+        for node_name, status in execution_plan.items():
+            reason = self.get_execution_reason(node_name, config, execution_plan)
+            downstream = [d for d in self.get_all_downstream_nodes(node_name) if d in execution_plan]
+            dependencies = self.get_dependencies(node_name)
+            self.logger.info(f"  {node_name}: {status} (Reason: {reason})")
+            if dependencies:
+                self.logger.info(f"    -> Depends on: {dependencies}")
+            if downstream:
+                self.logger.info(f"    -> Affects downstream (required): {downstream}")
+
+    def _run_dirty_path(
+        self,
+        config: Dict,
+        execution_plan: Dict[str, str],
+        execution_order: List[str],
+        required: Set[str],
+    ) -> Dict[str, Any]:
+        """Run missing nodes and cached frontier nodes for required subgraph."""
+        to_process = {n for n, s in execution_plan.items() if s == "MISSING"}
+        frontier = self._cached_frontier(execution_plan, required, to_process)
+        work_set = to_process | frontier
+        filtered_order = [n for n in execution_order if n in work_set]
+
+        results: Dict[str, Any] = {}
+        self.logger.info(f"\nEXECUTING {sum(execution_plan[n] == 'MISSING' for n in filtered_order)} NODES:")
+        if any(execution_plan[n] == "CACHED" for n in filtered_order):
+            self.logger.info(f"LOADING {sum(execution_plan[n]=='CACHED' for n in filtered_order)} NODES FROM CACHE:")
+
+        for n in filtered_order:
+            if execution_plan[n] == "MISSING":
+                ins = {}
+                for i in self.nodes[n].inputs:
+                    val = results[i]
+                    if isinstance(val, dict) and val.get("__artifact__"):
+                        ins[i] = self._load_artifact(val)
+                    else:
+                        ins[i] = val
+                results[n] = self.execute_node(n, config, ins)
+            else:
+                results[n] = self._load_node_from_cache(config, n)
+                self.logger.info(f"    {n}: [LOADED FROM CACHE]")
+
+        return results
     
     def run_pipeline(self, config: Dict, materialize: Union[str, Sequence[str]] = "sinks") -> Dict[str, Any]:
         """
@@ -965,36 +991,17 @@ class ResearchPipeline:
         # 1) Decide outputs we actually want to return
         self.logger.info("[DEBUG] Starting _resolve_materialize_set")
         original_materialize = materialize
-        outputs = self._resolve_materialize_set(materialize)
+        outputs, auto_computed_outputs = self._resolve_outputs_for_run(config, materialize)
         self.logger.info(f"[DEBUG] _resolve_materialize_set completed -> outputs={outputs}")
 
         # 2) Decide what we must plan/compute (ancestor closure of outputs)
         self.logger.info("[DEBUG] Computing required node set")
-        auto_computed_outputs = []  # Track outputs we auto-compute due to config changes
         if not outputs:
-            # Even when materialize="none", we should still check if any default outputs
-            # are invalid (e.g., due to config changes) and compute them
-            default_outputs = self._default_outputs()
-            if default_outputs:
-                # Check if any default outputs are invalid
-                invalid_defaults = []
-                for node_name in default_outputs:
-                    cache_key = self.get_node_cache_key(config, node_name)
-                    if not self.is_cache_valid(node_name, cache_key):
-                        invalid_defaults.append(node_name)
-                
-                if invalid_defaults:
-                    self.logger.info(f"[DEBUG] Found {len(invalid_defaults)} invalid default output(s) due to config/code changes: {invalid_defaults}")
-                    self.logger.info("[DEBUG] Computing invalid nodes even though materialize='none' (config changed)")
-                    # Use invalid defaults as outputs to trigger computation, but mark them as auto-computed
-                    outputs = invalid_defaults
-                    auto_computed_outputs = invalid_defaults
-                else:
-                    self.logger.info("\n[OPTIMIZATION] No outputs requested and all default outputs are cached → no work")
-                    return {}
-            else:
-                self.logger.info("\n[OPTIMIZATION] No outputs requested → no work")
+            if isinstance(original_materialize, (list, tuple, set)) and len(original_materialize) > 0:
+                self.logger.info("\n[OPTIMIZATION] No valid materialize targets resolved → no work")
                 return {}
+            self.logger.info("\n[OPTIMIZATION] No outputs requested and all default outputs are cached → no work")
+            return {}
         required = self._required_nodes(outputs)
         self.logger.info(f"[DEBUG] Required nodes resolved: {sorted(required)}")
 
@@ -1003,16 +1010,7 @@ class ResearchPipeline:
         execution_plan = self.determine_execution_plan(config, required)
         self.logger.info("[DEBUG] determine_execution_plan completed")
 
-        self.logger.info("\nEXECUTION PLAN:")
-        for node_name, status in execution_plan.items():
-            reason = self.get_execution_reason(node_name, config, execution_plan)
-            downstream = [d for d in self.get_all_downstream_nodes(node_name) if d in execution_plan]
-            dependencies = self.get_dependencies(node_name)
-            self.logger.info(f"  {node_name}: {status} (Reason: {reason})")
-            if dependencies:
-                self.logger.info(f"    -> Depends on: {dependencies}")
-            if downstream:
-                self.logger.info(f"    -> Affects downstream (required): {downstream}")
+        self._log_execution_plan(config, execution_plan)
 
         # 4) Execution order in required subgraph
         execution_order = [n for n in self._get_execution_order() if n in required]
@@ -1024,48 +1022,18 @@ class ResearchPipeline:
             self.logger.info(f"\n[OPTIMIZATION] All {len(execution_order)} required nodes cached; materializing outputs only")
             results = {}
             for n in outputs:
-                key = self.get_node_cache_key(config, n)
-                results[n] = self.load_cache(n, key)
-                self._mark_recent(n, key)
+                results[n] = self._load_node_from_cache(config, n)
                 self.logger.info(f"    {n}: [LOADED FROM CACHE]")
             return results
 
         # 6) Dirty path: compute dirty, load only nearest cached parents (frontier)
-        to_process = {n for n, s in execution_plan.items() if s == "MISSING"}
-        frontier = self._cached_frontier(execution_plan, required, to_process)
-        work_set = to_process | frontier
-        filtered_order = [n for n in execution_order if n in work_set]
-
-        results = {}
-        self.logger.info(f"\nEXECUTING {sum(execution_plan[n] == 'MISSING' for n in filtered_order)} NODES:")
-        if any(execution_plan[n] == "CACHED" for n in filtered_order):
-            self.logger.info(f"LOADING {sum(execution_plan[n]=='CACHED' for n in filtered_order)} NODES FROM CACHE:")
-
         start_time = time.time()
-        for n in filtered_order:
-            if execution_plan[n] == "MISSING":
-                # Resolve artifact pointers in inputs automatically for downstream nodes
-                ins = {}
-                for i in self.nodes[n].inputs:
-                    val = results[i]
-                    # If input is an artifact pointer, resolve it automatically
-                    if isinstance(val, dict) and val.get("__artifact__"):
-                        ins[i] = self._load_artifact(val)
-                    else:
-                        ins[i] = val
-                results[n] = self.execute_node(n, config, ins)
-            else:
-                key = self.get_node_cache_key(config, n)
-                results[n] = self.load_cache(n, key)
-                self._mark_recent(n, key)
-                self.logger.info(f"    {n}: [LOADED FROM CACHE]")
+        results = self._run_dirty_path(config, execution_plan, execution_order, required)
 
         # 7) Ensure requested outputs are returned (load if not produced above)
         for n in outputs:
             if n not in results:
-                key = self.get_node_cache_key(config, n)
-                results[n] = self.load_cache(n, key)
-                self._mark_recent(n, key)
+                results[n] = self._load_node_from_cache(config, n)
                 self.logger.info(f"    {n}: [LOADED FROM CACHE] (output)")
 
         # 8) If we auto-computed nodes due to config changes but materialize was "none",
@@ -1076,7 +1044,8 @@ class ResearchPipeline:
             return {}
 
         self.logger.info(f"\nEXECUTION COMPLETED in {time.time() - start_time:.2f} seconds")
-        return results
+        # Return only requested outputs for consistent cold/warm materialization behavior.
+        return {n: results[n] for n in outputs if n in results}
     
     def _get_execution_order(self) -> List[str]:
         """
@@ -1207,6 +1176,16 @@ class ResearchPipeline:
                         self.logger.warning(f"Failed to delete {cache_dir}: {e}")
         
         self.logger.info(f"Invalidated {node_name}: deleted {deleted_count} cache files")
+
+    def _unique_preserve_order(self, items: List[str]) -> List[str]:
+        """Return unique items while preserving first-seen order."""
+        seen = set()
+        unique = []
+        for item in items:
+            if item not in seen:
+                seen.add(item)
+                unique.append(item)
+        return unique
     
     def invalidate_upstream(self, config: Dict, target_node: str) -> None:
         """
@@ -1222,15 +1201,7 @@ class ResearchPipeline:
         
         # Get all upstream dependencies (including the target node itself)
         dependencies = self.get_dependencies(target_node)
-        nodes_to_invalidate = dependencies + [target_node]
-        
-        # Remove duplicates while preserving order
-        seen = set()
-        unique_nodes = []
-        for node in nodes_to_invalidate:
-            if node not in seen:
-                seen.add(node)
-                unique_nodes.append(node)
+        unique_nodes = self._unique_preserve_order(dependencies + [target_node])
         
         deleted_count = 0
         for node_name in unique_nodes:
@@ -1254,15 +1225,7 @@ class ResearchPipeline:
         
         # Get all downstream dependents (including the target node itself)
         dependents = self.get_all_downstream_nodes(target_node)
-        nodes_to_invalidate = [target_node] + dependents
-        
-        # Remove duplicates while preserving order
-        seen = set()
-        unique_nodes = []
-        for node in nodes_to_invalidate:
-            if node not in seen:
-                seen.add(node)
-                unique_nodes.append(node)
+        unique_nodes = self._unique_preserve_order([target_node] + dependents)
         
         deleted_count = 0
         for node_name in unique_nodes:
@@ -1285,11 +1248,11 @@ class ResearchPipeline:
             True if cache was deleted, False if no cache found
         """
 
-        # Get the cache key for this node with the current config
-        cache_key = self.get_node_cache_key(config, node_name)
-
         if node_name not in self.nodes:
             raise ValueError(f"Node '{node_name}' not found")
+
+        # Get the cache key for this node with the current config
+        cache_key = self.get_node_cache_key(config, node_name)
         
         # Get the specific cache directory for this config
         cache_dir = self.cache_dir / node_name / cache_key
@@ -1752,14 +1715,6 @@ class ResearchPipeline:
             # Primitive value
             formatted = f'{data:.6f}' if isinstance(data, float) else str(data)
             return f'{indent_str}<div class="stats-value">{formatted}</div>'
-    
-    def _escape_html(self, text: str) -> str:
-        """Escape HTML special characters"""
-        return (text.replace('&', '&amp;')
-                   .replace('<', '&lt;')
-                   .replace('>', '&gt;')
-                   .replace('"', '&quot;')
-                   .replace("'", '&#39;'))
     
     def _find_visualization_path(self, result: Any) -> Optional[Path]:
         """Find HTML visualization file path from result"""

@@ -5,12 +5,22 @@ All tables use class="simpletable" for consistent styling across studies.
 """
 
 from typing import Dict, List, Optional, Callable, Any, Union
-import warnings
 
 
 def _default_var_formatter(var: str) -> str:
     """Default variable name formatter: replace underscores with spaces and title case."""
     return var.replace('_', ' ').title()
+
+
+def _sig_stars(pval: float) -> str:
+    """Return significance stars from p-value."""
+    if pval < 0.001:
+        return "***"
+    if pval < 0.01:
+        return "**"
+    if pval < 0.05:
+        return "*"
+    return ""
 
 
 def simpletable(
@@ -77,7 +87,6 @@ def descriptive_stats_table(
     """
     try:
         import pandas as pd
-        import numpy as np
     except ImportError:
         return "<p>pandas/numpy required for descriptive statistics</p>"
     
@@ -230,12 +239,7 @@ def correlation_matrix_table(
                         try:
                             t_stat = corr_val * np.sqrt((n - 2) / (1 - corr_val**2 + 1e-10))
                             p_val = 2 * (1 - t.cdf(abs(t_stat), n - 2))
-                            if p_val < 0.001:
-                                sig = "***"
-                            elif p_val < 0.01:
-                                sig = "**"
-                            elif p_val < 0.05:
-                                sig = "*"
+                            sig = _sig_stars(p_val)
                         except:
                             pass
                     html.append(f'<td>{corr_val:.2f}{sig}</td>')
@@ -394,13 +398,7 @@ def regression_table(
         se = std_errors.get(var, 0)
         pval = p_values.get(var, 1)
         
-        sig = ""
-        if pval < 0.001:
-            sig = "***"
-        elif pval < 0.01:
-            sig = "**"
-        elif pval < 0.05:
-            sig = "*"
+        sig = _sig_stars(pval)
         
         var_display = var_formatter(var)
         
@@ -490,13 +488,7 @@ def combined_regression_table(
                 pval = p_values.get(var, 1)
                 se = std_errors.get(var, 0)
                 
-                sig = ""
-                if pval < 0.001:
-                    sig = "***"
-                elif pval < 0.01:
-                    sig = "**"
-                elif pval < 0.05:
-                    sig = "*"
+                sig = _sig_stars(pval)
                 
                 cell = f'<td>{coef:.4f}{sig}<br/><span style="color:#666">({se:.4f})</span>'
                 if show_p_values:

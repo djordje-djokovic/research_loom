@@ -6,9 +6,40 @@ Provides reusable argument parsing and command handling for all studies.
 import argparse
 import sys
 from typing import Dict, Any, List, Optional, Callable
-from pathlib import Path
 
 from research_loom.pipeline.core import ResearchPipeline, create_study_structure
+
+
+def _collect_invalidated_nodes(
+    pipeline: ResearchPipeline,
+    force_downstream: Optional[List[str]],
+    force_upstream: Optional[List[str]],
+    force_all: bool,
+    force_only: Optional[List[str]],
+) -> set:
+    """Compute the node set that will be invalidated by force flags."""
+    invalidated = set()
+    if force_all:
+        return set(pipeline.nodes.keys())
+
+    if force_downstream:
+        for node_name in force_downstream:
+            if node_name in pipeline.nodes:
+                invalidated.add(node_name)
+                invalidated.update(pipeline.get_all_downstream_nodes(node_name))
+
+    if force_upstream:
+        for node_name in force_upstream:
+            if node_name in pipeline.nodes:
+                invalidated.add(node_name)
+                invalidated.update(pipeline.get_dependencies(node_name))
+
+    if force_only:
+        for node_name in force_only:
+            if node_name in pipeline.nodes:
+                invalidated.add(node_name)
+
+    return invalidated
 
 
 def setup_cli_parser(description: str = "Run research pipeline", epilog: Optional[str] = None) -> argparse.ArgumentParser:
@@ -270,25 +301,13 @@ def run_cli(
     if (args.force_downstream is not None or args.force_upstream is not None or 
         args.force_all or args.force_only is not None):
         temp_pipeline = create_pipeline()
-        
-        # Collect nodes that will be invalidated
-        if args.force_all:
-            invalidated_nodes = set(temp_pipeline.nodes.keys())
-        else:
-            if args.force_downstream:
-                for node_name in args.force_downstream:
-                    if node_name in temp_pipeline.nodes:
-                        invalidated_nodes.add(node_name)
-                        invalidated_nodes.update(temp_pipeline.get_all_downstream_nodes(node_name))
-            if args.force_upstream:
-                for node_name in args.force_upstream:
-                    if node_name in temp_pipeline.nodes:
-                        invalidated_nodes.add(node_name)
-                        invalidated_nodes.update(temp_pipeline.get_dependencies(node_name))
-            if args.force_only:
-                for node_name in args.force_only:
-                    if node_name in temp_pipeline.nodes:
-                        invalidated_nodes.add(node_name)
+        invalidated_nodes = _collect_invalidated_nodes(
+            temp_pipeline,
+            args.force_downstream,
+            args.force_upstream,
+            args.force_all,
+            args.force_only,
+        )
         
         handle_invalidation(
             temp_pipeline, 
