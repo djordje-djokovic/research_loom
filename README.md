@@ -174,9 +174,18 @@ logging:
     keep_last_n: 20
     include_edge_payloads: true
     write_latest_pointer: true
+    layout:
+      node_spacing: 55        # increase to reduce vertical overlap
+      layer_spacing: 120      # increase to spread columns apart
+      edge_node_spacing: 30   # increase to keep edges farther from nodes
 ```
 
 Projects consuming `research_loom` (for example `secondary_sale`) must add this block before upgrading to this version.
+
+Pipeline DAG HTML interactions:
+- Single-click a node to open its output artifact panel.
+- Double-click a node to open its primary artifact directly.
+- For tabular outputs (`parquet`, `json.zst`, `jsonl.zst`, `csv`, `json`), the report writes preview HTML files and exposes `Preview` links.
 
 ## Cache Management
 

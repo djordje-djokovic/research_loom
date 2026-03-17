@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import csv
+import json as pyjson
 import json
-import math
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +20,7 @@ REQUIRED_REPORT_KEYS = {
     "keep_last_n",
     "include_edge_payloads",
     "write_latest_pointer",
+    "layout",
 }
 ALLOWED_FORMATS = {"json", "html", "both"}
 
@@ -47,6 +50,7 @@ def validate_report_config(report_cfg: Dict[str, Any]) -> Dict[str, Any]:
     keep_last_n = report_cfg["keep_last_n"]
     include_edge_payloads = report_cfg["include_edge_payloads"]
     write_latest_pointer = report_cfg["write_latest_pointer"]
+    layout = report_cfg["layout"]
 
     if not isinstance(enabled, bool):
         raise ValueError("logging.pipeline_report.enabled must be boolean")
@@ -60,6 +64,26 @@ def validate_report_config(report_cfg: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("logging.pipeline_report.include_edge_payloads must be boolean")
     if not isinstance(write_latest_pointer, bool):
         raise ValueError("logging.pipeline_report.write_latest_pointer must be boolean")
+    if not isinstance(layout, dict):
+        raise ValueError("logging.pipeline_report.layout must be an object")
+
+    layout_keys = {"node_spacing", "layer_spacing", "edge_node_spacing"}
+    missing_layout = sorted(layout_keys - set(layout.keys()))
+    if missing_layout:
+        raise ValueError(f"logging.pipeline_report.layout missing required keys: {missing_layout}")
+    unknown_layout = sorted(set(layout.keys()) - layout_keys)
+    if unknown_layout:
+        raise ValueError(f"logging.pipeline_report.layout contains unknown keys: {unknown_layout}")
+
+    node_spacing = layout["node_spacing"]
+    layer_spacing = layout["layer_spacing"]
+    edge_node_spacing = layout["edge_node_spacing"]
+    if not isinstance(node_spacing, (int, float)) or node_spacing < 20:
+        raise ValueError("logging.pipeline_report.layout.node_spacing must be a number >= 20")
+    if not isinstance(layer_spacing, (int, float)) or layer_spacing < 40:
+        raise ValueError("logging.pipeline_report.layout.layer_spacing must be a number >= 40")
+    if not isinstance(edge_node_spacing, (int, float)) or edge_node_spacing < 0:
+        raise ValueError("logging.pipeline_report.layout.edge_node_spacing must be a number >= 0")
 
     return {
         "enabled": enabled,
@@ -68,6 +92,11 @@ def validate_report_config(report_cfg: Dict[str, Any]) -> Dict[str, Any]:
         "keep_last_n": keep_last_n,
         "include_edge_payloads": include_edge_payloads,
         "write_latest_pointer": write_latest_pointer,
+        "layout": {
+            "node_spacing": float(node_spacing),
+            "layer_spacing": float(layer_spacing),
+            "edge_node_spacing": float(edge_node_spacing),
+        },
     }
 
 
@@ -128,174 +157,230 @@ def _edge_tooltip_lines(edge: Dict[str, Any]) -> List[str]:
     ]
 
 
-def _encode_tooltip(lines: List[str]) -> str:
-    return _escape("\n".join(lines))
+def _slugify(text: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]+", "-", text).strip("-").lower() or "node"
 
 
-def _arrow_points(x2: float, y2: float, c2x: float, c2y: float, size: float = 10.0) -> str:
-    angle = math.atan2(y2 - c2y, x2 - c2x)
-    ux = math.cos(angle)
-    uy = math.sin(angle)
-    bx = x2 - ux * size
-    by = y2 - uy * size
-    px = -uy
-    py = ux
-    w = size * 0.6
-    lx = bx + px * w
-    ly = by + py * w
-    rx = bx - px * w
-    ry = by - py * w
-    return f"{x2:.1f},{y2:.1f} {lx:.1f},{ly:.1f} {rx:.1f},{ry:.1f}"
+def _preview_eligible(fmt: Optional[str]) -> bool:
+    return (fmt or "").lower() in {"parquet", "json.zst", "jsonl.zst", "csv", "json"}
+
+
+def _rows_from_object(payload: Any, max_rows: int = 40) -> Dict[str, Any]:
+    rows: List[Dict[str, Any]] = []
+    columns: List[str] = []
+
+    def append_row(item: Any) -> None:
+        nonlocal columns
+        if isinstance(item, dict):
+            row = {str(k): item.get(k) for k in item.keys()}
+        else:
+            row = {"value": item}
+        for c in row.keys():
+            if c not in columns:
+                columns.append(c)
+        rows.append(row)
+
+    if isinstance(payload, list):
+        for item in payload[:max_rows]:
+            append_row(item)
+        total = len(payload)
+    elif isinstance(payload, dict):
+        list_key = None
+        for k, v in payload.items():
+            if isinstance(v, list):
+                list_key = k
+                break
+        if list_key is not None:
+            src = payload.get(list_key) or []
+            for item in src[:max_rows]:
+                append_row(item)
+            total = len(src)
+        else:
+            append_row(payload)
+            total = 1
+    else:
+        append_row(payload)
+        total = 1
+
+    return {"columns": columns, "rows": rows, "row_count": total}
+
+
+def _extract_preview_rows(artifact_path: Path, fmt: str, max_rows: int = 40) -> Optional[Dict[str, Any]]:
+    lower = fmt.lower()
+    try:
+        if lower == "csv":
+            with artifact_path.open("r", encoding="utf-8", newline="") as fh:
+                reader = csv.DictReader(fh)
+                rows = []
+                for i, row in enumerate(reader):
+                    if i >= max_rows:
+                        break
+                    rows.append(dict(row))
+                return {"columns": list(reader.fieldnames or []), "rows": rows, "row_count": len(rows)}
+        if lower == "json":
+            payload = pyjson.loads(artifact_path.read_text(encoding="utf-8"))
+            return _rows_from_object(payload, max_rows=max_rows)
+        if lower in {"json.zst", "jsonl.zst"}:
+            import zstandard as zstd
+
+            with artifact_path.open("rb") as fh:
+                dctx = zstd.ZstdDecompressor()
+                with dctx.stream_reader(fh) as reader:
+                    raw = reader.read().decode("utf-8")
+            if lower == "jsonl.zst":
+                out = []
+                for line in raw.splitlines():
+                    if not line.strip():
+                        continue
+                    try:
+                        out.append(pyjson.loads(line))
+                    except Exception:
+                        continue
+                    if len(out) >= max_rows:
+                        break
+                return _rows_from_object(out, max_rows=max_rows)
+            payload = pyjson.loads(raw)
+            return _rows_from_object(payload, max_rows=max_rows)
+        if lower == "parquet":
+            import pandas as pd
+
+            df = pd.read_parquet(artifact_path)
+            head = df.head(max_rows)
+            rows = head.to_dict(orient="records")
+            return {"columns": [str(c) for c in head.columns], "rows": rows, "row_count": int(len(df))}
+    except Exception:
+        return None
+    return None
+
+
+def _write_preview_html(
+    preview_path: Path,
+    node_name: str,
+    artifact: Dict[str, Any],
+    preview_data: Dict[str, Any],
+) -> None:
+    columns = [str(c) for c in (preview_data.get("columns") or [])]
+    rows = preview_data.get("rows") or []
+    row_count = int(preview_data.get("row_count") or 0)
+    table_head = "".join(f"<th>{_escape(c)}</th>" for c in columns) if columns else "<th>value</th>"
+    table_rows: List[str] = []
+    for row in rows:
+        table_rows.append("<tr>" + "".join(f"<td>{_escape(row.get(c, ''))}</td>" for c in columns) + "</tr>")
+    if not table_rows:
+        table_rows.append("<tr><td><i>No preview rows available</i></td></tr>")
+
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Artifact Preview - {_escape(node_name)}::{_escape(str(artifact.get("key")))}</title>
+  <style>
+    body {{ font-family: Segoe UI, Arial, sans-serif; margin: 18px; background: #0f172a; color: #e2e8f0; }}
+    .meta {{ margin-bottom: 12px; font-size: 13px; color: #cbd5e1; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
+    th, td {{ border: 1px solid #334155; padding: 6px 8px; text-align: left; vertical-align: top; }}
+    th {{ background: #1e293b; color: #93c5fd; }}
+    tr:nth-child(even) td {{ background: #111827; }}
+  </style>
+</head>
+<body>
+  <h2>Preview: {_escape(node_name)} :: {_escape(str(artifact.get("key")))}</h2>
+  <div class="meta">
+    <b>Format:</b> {_escape(artifact.get("format"))} |
+    <b>Rows shown:</b> {len(rows)} |
+    <b>Total rows:</b> {row_count} |
+    <b>Source:</b> {_escape(artifact.get("abs_path"))}
+  </div>
+  <table>
+    <thead><tr>{table_head}</tr></thead>
+    <tbody>{''.join(table_rows)}</tbody>
+  </table>
+</body>
+</html>
+"""
+    preview_path.write_text(html, encoding="utf-8")
+
+
+def _select_primary_artifact(artifact_links: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not artifact_links:
+        return None
+    format_priority = {"html": 0, "png": 1, "jpg": 1, "jpeg": 1, "webp": 1, "gif": 1}
+    best = None
+    best_score = (99, 99)
+    for idx, link in enumerate(artifact_links):
+        fmt = str(link.get("format") or "").lower()
+        has_preview = bool(link.get("preview_href"))
+        open_href = bool(link.get("open_href"))
+        if fmt in format_priority:
+            score = (format_priority[fmt], idx)
+        elif has_preview:
+            score = (2, idx)
+        elif open_href:
+            score = (3, idx)
+        else:
+            score = (8, idx)
+        if best is None or score < best_score:
+            best = link
+            best_score = score
+    return best
+
+
+def _build_enriched_manifest(manifest: Dict[str, Any], output_dir: Path, include_previews: bool) -> Dict[str, Any]:
+    data = pyjson.loads(pyjson.dumps(manifest))
+    run_id = str(data.get("run_id") or "run")
+    previews_dir = output_dir / "previews"
+    if include_previews:
+        previews_dir.mkdir(parents=True, exist_ok=True)
+
+    for node in data.get("nodes", []):
+        artifact_links: List[Dict[str, Any]] = []
+        for idx, artifact in enumerate(node.get("output_artifacts", []) or []):
+            abs_path = str(artifact.get("abs_path") or "").strip()
+            fmt = str(artifact.get("format") or "")
+            link = {
+                "key": artifact.get("key"),
+                "format": fmt,
+                "bytes": artifact.get("bytes"),
+                "path": artifact.get("path"),
+                "abs_path": abs_path,
+                "open_href": None,
+                "preview_href": None,
+            }
+            if abs_path:
+                p = Path(abs_path)
+                if p.exists():
+                    link["open_href"] = p.resolve().as_uri()
+                    if include_previews and _preview_eligible(fmt):
+                        preview_data = _extract_preview_rows(p, fmt)
+                        if preview_data is not None:
+                            preview_name = f"{run_id}_{_slugify(str(node.get('name')))}_{idx}.html"
+                            preview_path = previews_dir / preview_name
+                            _write_preview_html(preview_path, str(node.get("name")), artifact, preview_data)
+                            link["preview_href"] = preview_path.resolve().as_uri()
+            artifact_links.append(link)
+
+        node["artifact_links"] = artifact_links
+        primary = _select_primary_artifact(artifact_links)
+        if primary:
+            node["primary_artifact_href"] = primary.get("open_href")
+            node["primary_preview_href"] = primary.get("preview_href")
+            node["primary_artifact_key"] = primary.get("key")
+        else:
+            node["primary_artifact_href"] = None
+            node["primary_preview_href"] = None
+            node["primary_artifact_key"] = None
+    return data
 
 
 def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
     nodes = manifest.get("nodes", [])
     edges = manifest.get("edges", [])
-    node_by_name = {n["name"]: n for n in nodes}
-
-    # Layer nodes by dependency depth.
-    parents: Dict[str, List[str]] = {n["name"]: [] for n in nodes}
-    for edge in edges:
-        parents.setdefault(edge["target"], []).append(edge["source"])
-    memo: Dict[str, int] = {}
-
-    def depth(name: str) -> int:
-        if name in memo:
-            return memo[name]
-        p = parents.get(name, [])
-        if not p:
-            memo[name] = 0
-            return 0
-        d = 1 + max(depth(parent) for parent in p)
-        memo[name] = d
-        return d
-
-    layers: Dict[int, List[str]] = {}
-    for n in node_by_name:
-        layers.setdefault(depth(n), []).append(n)
-    for level_nodes in layers.values():
-        level_nodes.sort()
-
-    children: Dict[str, List[str]] = {n["name"]: [] for n in nodes}
-    for edge in edges:
-        children.setdefault(edge["source"], []).append(edge["target"])
-
-    max_level = max(layers.keys(), default=0)
-    # Barycentric sweeps reduce crossings/overlap by ordering each layer
-    # based on neighboring layers' current order.
-    for _ in range(6):
-        # Forward sweep (parents)
-        for level in range(1, max_level + 1):
-            prev_nodes = layers.get(level - 1, [])
-            prev_rank = {name: idx for idx, name in enumerate(prev_nodes)}
-
-            def parent_score(name: str):
-                p = parents.get(name, [])
-                vals = [prev_rank[x] for x in p if x in prev_rank]
-                if vals:
-                    return sum(vals) / len(vals)
-                return float("inf")
-
-            layers[level] = sorted(layers.get(level, []), key=lambda n: (parent_score(n), n))
-
-        # Backward sweep (children)
-        for level in range(max_level - 1, -1, -1):
-            next_nodes = layers.get(level + 1, [])
-            next_rank = {name: idx for idx, name in enumerate(next_nodes)}
-
-            def child_score(name: str):
-                c = children.get(name, [])
-                vals = [next_rank[x] for x in c if x in next_rank]
-                if vals:
-                    return sum(vals) / len(vals)
-                return float("inf")
-
-            layers[level] = sorted(layers.get(level, []), key=lambda n: (child_score(n), n))
-
-    max_elapsed = max((float(n.get("elapsed_s", 0.0)) for n in nodes), default=1.0)
-    width = max(1200, 320 * max(len(layers), 1))
-    height = max(700, 170 * max((len(v) for v in layers.values()), default=1))
-    x_step = width / max(len(layers), 1)
-    positions: Dict[str, Dict[str, float]] = {}
-
-    for level, level_nodes in sorted(layers.items()):
-        y_step = height / (len(level_nodes) + 1)
-        for idx, name in enumerate(level_nodes, start=1):
-            n = node_by_name[name]
-            elapsed = float(n.get("elapsed_s", 0.0))
-            w = 180 + 140 * math.sqrt(max(elapsed, 0.0) / max(max_elapsed, 1e-9))
-            h = 62
-            x = (level + 0.5) * x_step
-            y = idx * y_step
-            positions[name] = {"x": x, "y": y, "w": w, "h": h}
-
-    def node_color(status: str) -> str:
-        if status == "computed":
-            return "#2f855a"
-        if status == "cached":
-            return "#2b6cb0"
-        if status == "failed":
-            return "#c53030"
-        return "#4a5568"
-
-    payload_values = [float(edge.get("payload_bytes") or 0) for edge in edges]
-    max_payload = max(payload_values, default=0.0)
-
-    svg_lines: List[str] = []
-    svg_lines.append(f'<svg viewBox="0 0 {int(width)} {int(height)}" width="100%" height="780" role="img">')
-
-    for edge_idx, edge in enumerate(edges):
-        src = positions.get(edge["source"])
-        dst = positions.get(edge["target"])
-        if not src or not dst:
-            continue
-        payload = float(edge.get("payload_bytes") or 0)
-        stroke = 1.0
-        if max_payload > 0 and payload > 0:
-            # Sqrt-scaled linear sizing keeps large payloads visibly thicker
-            # while avoiding extreme line widths.
-            stroke = 1.0 + 5.0 * math.sqrt(payload / max_payload)
-        tooltip = _encode_tooltip(_edge_tooltip_lines(edge))
-        x1 = src["x"] + src["w"] / 2.0
-        y1 = src["y"]
-        x2 = dst["x"] - dst["w"] / 2.0
-        y2 = dst["y"]
-        # Gentle cubic routing reduces visual collisions with nodes/labels
-        # versus strict straight-line edges.
-        dx = max((x2 - x1) * 0.45, 40.0)
-        c1x = x1 + dx
-        c1y = y1 + (y2 - y1) * 0.2
-        c2x = x2 - dx
-        c2y = y2 - (y2 - y1) * 0.2
-        path_d = f"M {x1:.1f} {y1:.1f} C {c1x:.1f} {c1y:.1f}, {c2x:.1f} {c2y:.1f}, {x2:.1f} {y2:.1f}"
-        points = _arrow_points(x2, y2, c2x, c2y, size=11.5)
-        edge_id = f"e{edge_idx}"
-        svg_lines.append(
-            f'<path class="dag-hover dag-edge-path" data-edge-id="{edge_id}" data-source="{_escape(edge["source"])}" data-target="{_escape(edge["target"])}" data-tooltip="{tooltip}" d="{path_d}" fill="none" stroke="#a0aec0" stroke-width="{stroke:.2f}"></path>'
-        )
-        svg_lines.append(
-            f'<polygon class="dag-hover dag-edge-arrow" data-edge-id="{edge_id}" data-source="{_escape(edge["source"])}" data-target="{_escape(edge["target"])}" data-tooltip="{tooltip}" points="{points}" fill="#a0aec0"></polygon>'
-        )
-
-    for node in nodes:
-        name = node["name"]
-        pos = positions.get(name)
-        if not pos:
-            continue
-        fill = node_color(str(node.get("status", "unknown")))
-        tooltip = _encode_tooltip(_tooltip_lines(node))
-        x = pos["x"] - pos["w"] / 2.0
-        y = pos["y"] - pos["h"] / 2.0
-        svg_lines.append(
-            f'<rect class="dag-hover dag-node" data-node="{_escape(name)}" data-cx="{pos["x"]:.1f}" data-cy="{pos["y"]:.1f}" data-w="{pos["w"]:.1f}" data-h="{pos["h"]:.1f}" data-tooltip="{tooltip}" x="{x:.1f}" y="{y:.1f}" width="{pos["w"]:.1f}" height="{pos["h"]:.1f}" rx="10" fill="{fill}" opacity="0.95" stroke="#1a202c" stroke-width="1.0" style="cursor: grab;"></rect>'
-        )
-        label = _escape(name)
-        sub = _escape(f"{node.get('status')} | {node.get('elapsed_s', 0.0):.2f}s")
-        svg_lines.append(f'<text data-node-label="{_escape(name)}" x="{pos["x"]:.1f}" y="{(pos["y"]-6):.1f}" text-anchor="middle" fill="#f7fafc" font-size="13" font-family="Segoe UI, Arial" font-weight="700" style="pointer-events:none;">{label}</text>')
-        svg_lines.append(f'<text data-node-sub="{_escape(name)}" x="{pos["x"]:.1f}" y="{(pos["y"]+14):.1f}" text-anchor="middle" fill="#edf2f7" font-size="11" font-family="Segoe UI, Arial" style="pointer-events:none;">{sub}</text>')
-
-    svg_lines.append("</svg>")
-    svg = "\n".join(svg_lines)
+    nodes_json = json.dumps(nodes, ensure_ascii=False)
+    edges_json = json.dumps(edges, ensure_ascii=False)
+    layout_settings_json = json.dumps(
+        manifest.get("layout", {"node_spacing": 55.0, "layer_spacing": 120.0, "edge_node_spacing": 30.0}),
+        ensure_ascii=False,
+    )
 
     table_rows = []
     for node in sorted(nodes, key=lambda item: float(item.get("elapsed_s", 0.0)), reverse=True):
@@ -373,6 +458,51 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
     }}
     .dag-tooltip .row {{ margin: 0 0 2px 0; }}
     .dag-tooltip .k {{ color: #93c5fd; font-weight: 700; }}
+    .artifact-panel {{
+      position: fixed;
+      right: 18px;
+      top: 18px;
+      width: 420px;
+      max-height: calc(100vh - 36px);
+      overflow: auto;
+      background: rgba(15, 23, 42, 0.98);
+      border: 1px solid #334155;
+      border-radius: 10px;
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.45);
+      padding: 10px 12px;
+      z-index: 9000;
+      display: none;
+    }}
+    .artifact-panel h3 {{ margin: 2px 0 8px 0; font-size: 15px; color: #93c5fd; }}
+    .artifact-panel .meta {{ font-size: 12px; margin-bottom: 10px; color: #cbd5e1; }}
+    .artifact-list {{ display: grid; gap: 8px; }}
+    .artifact-item {{
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 8px;
+      background: #111827;
+      font-size: 12px;
+    }}
+    .artifact-item .top {{ display: flex; justify-content: space-between; gap: 8px; margin-bottom: 6px; }}
+    .artifact-item .fmt {{ color: #93c5fd; font-weight: 700; }}
+    .artifact-item .key {{ color: #e2e8f0; font-weight: 600; }}
+    .artifact-actions a {{
+      color: #93c5fd;
+      text-decoration: none;
+      margin-right: 10px;
+      font-weight: 600;
+    }}
+    .artifact-actions a:hover {{ text-decoration: underline; }}
+    .artifact-close {{
+      float: right;
+      border: 1px solid #475569;
+      background: #1e293b;
+      color: #cbd5e1;
+      border-radius: 6px;
+      padding: 3px 8px;
+      cursor: pointer;
+      font-size: 12px;
+    }}
   </style>
 </head>
 <body>
@@ -388,7 +518,7 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
     <b>Ended:</b> {_escape(manifest.get("ended_at"))}
   </div>
   <div class="card">
-    {svg}
+    <svg id="dagSvg" viewBox="0 0 1800 900" width="100%" height="780" role="img"></svg>
   </div>
   <div class="card">
     <h2>Node Metrics</h2>
@@ -411,7 +541,454 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
     </table>
   </div>
   <div id="dagTooltip" class="dag-tooltip"></div>
+  <div id="artifactPanel" class="artifact-panel">
+    <button id="artifactPanelClose" class="artifact-close">Close</button>
+    <div id="artifactPanelBody"></div>
+  </div>
+  <script src="https://unpkg.com/elkjs/lib/elk.bundled.js"></script>
   <script>
+    const manifestNodes = {nodes_json};
+    const manifestEdges = {edges_json};
+    const manifestLayout = {layout_settings_json};
+    const NS = 'http://www.w3.org/2000/svg';
+
+    function nodeColor(status) {{
+      if (status === 'computed') return '#2f855a';
+      if (status === 'cached') return '#2b6cb0';
+      if (status === 'failed') return '#c53030';
+      return '#4a5568';
+    }}
+
+    function fmtBytes(n) {{
+      if (n === null || n === undefined) return 'n/a';
+      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      let v = Number(n);
+      let i = 0;
+      while (v >= 1024 && i < units.length - 1) {{ v /= 1024; i += 1; }}
+      return `${{v.toFixed(1)}} ${{units[i]}}`;
+    }}
+
+    function nodeTooltip(node) {{
+      const lines = [
+        `Node: ${{node.name}}`,
+        `Status: ${{node.status}}`,
+        `Refreshed: ${{node.refreshed}}`,
+        `Reason: ${{node.reason}}`,
+        `Elapsed: ${{Number(node.elapsed_s || 0).toFixed(2)}}s`,
+        `Output bytes: ${{fmtBytes(node.output_total_bytes)}}`,
+        `Input bytes: ${{fmtBytes(node.input_total_bytes)}}`,
+        `Cache file: ${{node.cache_file_path || 'n/a'}}`,
+        `Cache bytes: ${{fmtBytes(node.cache_file_bytes)}}`,
+        `Outputs: ${{(node.output_artifacts || []).length}} artifact(s)`,
+        `Inputs: ${{(node.input_artifacts || []).length}} artifact(s)`,
+      ];
+      (node.output_artifacts || []).slice(0, 3).forEach((a) => {{
+        lines.push(`OUT ${{a.key}}: ${{fmtBytes(a.bytes)}} @ ${{a.path}}`);
+      }});
+      if ((node.output_artifacts || []).length > 3) {{
+        lines.push(`... +${{(node.output_artifacts || []).length - 3}} more outputs`);
+      }}
+      (node.input_artifacts || []).slice(0, 3).forEach((a) => {{
+        lines.push(`IN ${{a.key}}: ${{fmtBytes(a.bytes)}} @ ${{a.path}}`);
+      }});
+      if ((node.input_artifacts || []).length > 3) {{
+        lines.push(`... +${{(node.input_artifacts || []).length - 3}} more inputs`);
+      }}
+      return lines.join('\\n');
+    }}
+
+    function edgeTooltip(edge) {{
+      return [`Edge: ${{edge.source}} -> ${{edge.target}}`, `Payload bytes: ${{fmtBytes(edge.payload_bytes)}}`].join('\\n');
+    }}
+
+    function escapeHtml(s) {{
+      return String(s ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }}
+
+    function renderArtifactPanel(node) {{
+      const panel = document.getElementById('artifactPanel');
+      const body = document.getElementById('artifactPanelBody');
+      if (!panel || !body || !node) return;
+      const links = Array.isArray(node.artifact_links) ? node.artifact_links : [];
+      let html = `
+        <h3>${{escapeHtml(node.name)}}</h3>
+        <div class="meta">
+          Status: <b>${{escapeHtml(node.status)}}</b> |
+          Elapsed: <b>${{Number(node.elapsed_s || 0).toFixed(2)}}s</b> |
+          Outputs: <b>${{links.length}}</b>
+        </div>
+      `;
+      if (!links.length) {{
+        html += `<div class="artifact-item">No output artifacts available for this node.</div>`;
+      }} else {{
+        html += '<div class="artifact-list">';
+        links.forEach((a) => {{
+          html += `
+            <div class="artifact-item">
+              <div class="top">
+                <span class="key">${{escapeHtml(a.key || 'artifact')}}</span>
+                <span class="fmt">${{escapeHtml(a.format || 'unknown')}}</span>
+              </div>
+              <div>Size: ${{fmtBytes(a.bytes)}}</div>
+              <div style="margin-top:4px;color:#94a3b8;">${{escapeHtml(a.path || a.abs_path || 'n/a')}}</div>
+              <div class="artifact-actions" style="margin-top:6px;">
+                ${{a.open_href ? `<a href="${{escapeHtml(a.open_href)}}" target="_blank" rel="noopener noreferrer">Open</a>` : ''}}
+                ${{a.preview_href ? `<a href="${{escapeHtml(a.preview_href)}}" target="_blank" rel="noopener noreferrer">Preview</a>` : ''}}
+              </div>
+            </div>
+          `;
+        }});
+        html += '</div>';
+      }}
+      body.innerHTML = html;
+      panel.style.display = 'block';
+    }}
+
+    function closeArtifactPanel() {{
+      const panel = document.getElementById('artifactPanel');
+      if (panel) panel.style.display = 'none';
+    }}
+
+    function arrowPoints(x2, y2, c2x, c2y, size = 11.5) {{
+      const angle = Math.atan2(y2 - c2y, x2 - c2x);
+      const ux = Math.cos(angle);
+      const uy = Math.sin(angle);
+      const bx = x2 - ux * size;
+      const by = y2 - uy * size;
+      const px = -uy;
+      const py = ux;
+      const w = size * 0.6;
+      const lx = bx + px * w;
+      const ly = by + py * w;
+      const rx = bx - px * w;
+      const ry = by - py * w;
+      return `${{x2}},${{y2}} ${{lx}},${{ly}} ${{rx}},${{ry}}`;
+    }}
+
+    function buildDims(nodes) {{
+      const maxElapsed = Math.max(...nodes.map((n) => Number(n.elapsed_s || 0)), 1);
+      const map = new Map();
+      nodes.forEach((n) => {{
+        const e = Number(n.elapsed_s || 0);
+        map.set(n.name, {{
+          w: 180 + 140 * Math.sqrt(Math.max(e, 0) / Math.max(maxElapsed, 1e-9)),
+          h: 62,
+        }});
+      }});
+      return map;
+    }}
+
+    async function elkLayout(nodes, edges, dims, layoutSettings) {{
+      if (!window.ELK) return null;
+      const elk = new ELK();
+      const nodeSpacing = Number(layoutSettings.node_spacing || 55);
+      const layerSpacing = Number(layoutSettings.layer_spacing || 120);
+      const edgeNodeSpacing = Number(layoutSettings.edge_node_spacing || 30);
+      const graph = {{
+        id: 'root',
+        layoutOptions: {{
+          'elk.algorithm': 'layered',
+          'elk.direction': 'RIGHT',
+          'elk.edgeRouting': 'SPLINES',
+          'elk.spacing.nodeNode': String(nodeSpacing),
+          'elk.layered.spacing.nodeNodeBetweenLayers': String(layerSpacing),
+          'elk.spacing.edgeNode': String(edgeNodeSpacing),
+          'elk.layered.crossingMinimization.strategy': 'LAYER_SWEEP',
+        }},
+        children: nodes.map((n) => {{
+          const d = dims.get(n.name);
+          return {{ id: n.name, width: d.w, height: d.h }};
+        }}),
+        edges: edges.map((e, i) => ({{
+          id: `e${{i}}`,
+          sources: [e.source],
+          targets: [e.target],
+        }})),
+      }};
+      const out = await elk.layout(graph);
+      const pos = new Map();
+      (out.children || []).forEach((c) => {{
+        pos.set(c.id, {{
+          x: Number(c.x || 0) + Number(c.width || 0) / 2,
+          y: Number(c.y || 0) + Number(c.height || 0) / 2,
+          w: Number(c.width || 0),
+          h: Number(c.height || 0),
+        }});
+      }});
+      const edgeSections = new Map();
+      (out.edges || []).forEach((e) => {{
+        if (e.sections && e.sections.length) edgeSections.set(e.id, e.sections[0]);
+      }});
+      return {{ width: Number(out.width || 1600), height: Number(out.height || 900), positions: pos, edgeSections }};
+    }}
+
+    function renderDag(layout, nodes, edges, dims) {{
+      const svg = document.getElementById('dagSvg');
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      const pad = 60;
+      svg.setAttribute('viewBox', `0 0 ${{Math.ceil(layout.width + pad * 2)}} ${{Math.ceil(layout.height + pad * 2)}}`);
+      const nodeByName = new Map(nodes.map((n) => [n.name, n]));
+      const closeBtn = document.getElementById('artifactPanelClose');
+      if (closeBtn) closeBtn.onclick = closeArtifactPanel;
+
+      const g = document.createElementNS(NS, 'g');
+      g.setAttribute('transform', `translate(${{pad}}, ${{pad}})`);
+      svg.appendChild(g);
+
+      const maxPayload = Math.max(...edges.map((e) => Number(e.payload_bytes || 0)), 0);
+      const edgePathEls = new Map();
+      const edgeArrowEls = new Map();
+      const edgeMeta = new Map();
+
+      edges.forEach((edge, idx) => {{
+        const edgeId = `e${{idx}}`;
+        edgeMeta.set(edgeId, edge);
+        const src = layout.positions.get(edge.source);
+        const dst = layout.positions.get(edge.target);
+        if (!src || !dst) return;
+
+        const payload = Number(edge.payload_bytes || 0);
+        let stroke = 1.0;
+        if (maxPayload > 0 && payload > 0) stroke = 1.0 + 5.0 * Math.sqrt(payload / maxPayload);
+
+        let x1 = src.x + src.w / 2, y1 = src.y, x2 = dst.x - dst.w / 2, y2 = dst.y;
+        let c1x, c1y, c2x, c2y, pathD;
+
+        const sec = layout.edgeSections.get(edgeId);
+        if (sec && sec.startPoint && sec.endPoint) {{
+          const pts = [sec.startPoint].concat(sec.bendPoints || []).concat([sec.endPoint]);
+          const p0 = pts[0], pN = pts[pts.length - 1];
+          x1 = Number(p0.x); y1 = Number(p0.y); x2 = Number(pN.x); y2 = Number(pN.y);
+          pathD = `M ${{x1}} ${{y1}}`;
+          for (let i = 1; i < pts.length; i += 1) pathD += ` L ${{Number(pts[i].x)}} ${{Number(pts[i].y)}}`;
+          const pPrev = pts.length > 1 ? pts[pts.length - 2] : p0;
+          c2x = Number(pPrev.x); c2y = Number(pPrev.y);
+        }} else {{
+          const dx = Math.max((x2 - x1) * 0.45, 40.0);
+          c1x = x1 + dx; c1y = y1 + (y2 - y1) * 0.2;
+          c2x = x2 - dx; c2y = y2 - (y2 - y1) * 0.2;
+          pathD = `M ${{x1}} ${{y1}} C ${{c1x}} ${{c1y}}, ${{c2x}} ${{c2y}}, ${{x2}} ${{y2}}`;
+        }}
+
+        const path = document.createElementNS(NS, 'path');
+        path.setAttribute('class', 'dag-hover dag-edge-path');
+        path.setAttribute('data-edge-id', edgeId);
+        path.setAttribute('data-source', edge.source);
+        path.setAttribute('data-target', edge.target);
+        path.setAttribute('data-tooltip', edgeTooltip(edge));
+        path.setAttribute('d', pathD);
+        path.setAttribute('fill', 'none');
+        path.setAttribute('stroke', '#a0aec0');
+        path.setAttribute('stroke-width', stroke.toFixed(2));
+        g.appendChild(path);
+        edgePathEls.set(edgeId, path);
+
+        const arrow = document.createElementNS(NS, 'polygon');
+        arrow.setAttribute('class', 'dag-hover dag-edge-arrow');
+        arrow.setAttribute('data-edge-id', edgeId);
+        arrow.setAttribute('data-source', edge.source);
+        arrow.setAttribute('data-target', edge.target);
+        arrow.setAttribute('data-tooltip', edgeTooltip(edge));
+        arrow.setAttribute('points', arrowPoints(x2, y2, c2x ?? x1, c2y ?? y1, 11.5));
+        arrow.setAttribute('fill', '#a0aec0');
+        g.appendChild(arrow);
+        edgeArrowEls.set(edgeId, arrow);
+      }});
+
+      const labelMap = new Map();
+      const subMap = new Map();
+      const nodeRectMap = new Map();
+      nodes.forEach((node) => {{
+        const p = layout.positions.get(node.name);
+        if (!p) return;
+        const rect = document.createElementNS(NS, 'rect');
+        rect.setAttribute('class', 'dag-hover dag-node');
+        rect.setAttribute('data-node', node.name);
+        rect.setAttribute('data-cx', String(p.x));
+        rect.setAttribute('data-cy', String(p.y));
+        rect.setAttribute('data-w', String(p.w));
+        rect.setAttribute('data-h', String(p.h));
+        rect.setAttribute('data-tooltip', nodeTooltip(node));
+        rect.setAttribute('x', String(p.x - p.w / 2));
+        rect.setAttribute('y', String(p.y - p.h / 2));
+        rect.setAttribute('width', String(p.w));
+        rect.setAttribute('height', String(p.h));
+        rect.setAttribute('rx', '10');
+        rect.setAttribute('fill', nodeColor(String(node.status || 'unknown')));
+        rect.setAttribute('opacity', '0.95');
+        rect.setAttribute('stroke', '#1a202c');
+        rect.setAttribute('stroke-width', '1.0');
+        rect.style.cursor = 'grab';
+        g.appendChild(rect);
+        nodeRectMap.set(node.name, rect);
+
+        const t1 = document.createElementNS(NS, 'text');
+        t1.setAttribute('data-node-label', node.name);
+        t1.setAttribute('x', String(p.x));
+        t1.setAttribute('y', String(p.y - 6));
+        t1.setAttribute('text-anchor', 'middle');
+        t1.setAttribute('fill', '#f7fafc');
+        t1.setAttribute('font-size', '13');
+        t1.setAttribute('font-family', 'Segoe UI, Arial');
+        t1.setAttribute('font-weight', '700');
+        t1.style.pointerEvents = 'none';
+        t1.textContent = node.name;
+        g.appendChild(t1);
+        labelMap.set(node.name, t1);
+
+        const t2 = document.createElementNS(NS, 'text');
+        t2.setAttribute('data-node-sub', node.name);
+        t2.setAttribute('x', String(p.x));
+        t2.setAttribute('y', String(p.y + 14));
+        t2.setAttribute('text-anchor', 'middle');
+        t2.setAttribute('fill', '#edf2f7');
+        t2.setAttribute('font-size', '11');
+        t2.setAttribute('font-family', 'Segoe UI, Arial');
+        t2.style.pointerEvents = 'none';
+        t2.textContent = `${{node.status}} | ${{Number(node.elapsed_s || 0).toFixed(2)}}s`;
+        g.appendChild(t2);
+        subMap.set(node.name, t2);
+      }});
+
+      // Tooltip
+      const tooltip = document.getElementById('dagTooltip');
+      const hoverEls = svg.querySelectorAll('.dag-hover[data-tooltip]');
+      const renderTooltip = (raw) => {{
+        const lines = String(raw || '').split('\\n');
+        const html = lines.map((line) => {{
+          const idx = line.indexOf(':');
+          if (idx > 0) {{
+            const k = line.slice(0, idx + 1);
+            const v = line.slice(idx + 1);
+            if (k === 'Node:') return `<div class="row"><span class="k">${{k}}</span><b>${{v}}</b></div>`;
+            return `<div class="row"><span class="k">${{k}}</span>${{v}}</div>`;
+          }}
+          return `<div class="row">${{line}}</div>`;
+        }}).join('');
+        tooltip.innerHTML = html;
+      }};
+      const move = (ev) => {{
+        tooltip.style.left = `${{ev.clientX + 14}}px`;
+        tooltip.style.top = `${{ev.clientY + 14}}px`;
+      }};
+      hoverEls.forEach((el) => {{
+        el.addEventListener('mouseenter', (ev) => {{
+          renderTooltip(el.getAttribute('data-tooltip'));
+          tooltip.style.display = 'block';
+          move(ev);
+        }});
+        el.addEventListener('mousemove', move);
+        el.addEventListener('mouseleave', () => {{ tooltip.style.display = 'none'; }});
+      }});
+
+      // Drag support
+      const getState = (name) => {{
+        const r = nodeRectMap.get(name);
+        if (!r) return null;
+        return {{
+          cx: parseFloat(r.getAttribute('data-cx') || '0'),
+          cy: parseFloat(r.getAttribute('data-cy') || '0'),
+          w: parseFloat(r.getAttribute('data-w') || '0'),
+          h: parseFloat(r.getAttribute('data-h') || '0'),
+        }};
+      }};
+      const setState = (name, cx, cy) => {{
+        const r = nodeRectMap.get(name);
+        if (!r) return;
+        const w = parseFloat(r.getAttribute('data-w') || '0');
+        const h = parseFloat(r.getAttribute('data-h') || '0');
+        r.setAttribute('data-cx', String(cx));
+        r.setAttribute('data-cy', String(cy));
+        r.setAttribute('x', String(cx - w / 2));
+        r.setAttribute('y', String(cy - h / 2));
+        const t1 = labelMap.get(name);
+        if (t1) {{ t1.setAttribute('x', String(cx)); t1.setAttribute('y', String(cy - 6)); }}
+        const t2 = subMap.get(name);
+        if (t2) {{ t2.setAttribute('x', String(cx)); t2.setAttribute('y', String(cy + 14)); }}
+      }};
+
+      const rerouteEdgeById = (edgeId) => {{
+        const e = edgeMeta.get(edgeId);
+        if (!e) return;
+        const src = getState(e.source);
+        const dst = getState(e.target);
+        if (!src || !dst) return;
+        const x1 = src.cx + src.w / 2, y1 = src.cy;
+        const x2 = dst.cx - dst.w / 2, y2 = dst.cy;
+        const dx = Math.max((x2 - x1) * 0.45, 40.0);
+        const c1x = x1 + dx, c1y = y1 + (y2 - y1) * 0.2;
+        const c2x = x2 - dx, c2y = y2 - (y2 - y1) * 0.2;
+        const d = `M ${{x1}} ${{y1}} C ${{c1x}} ${{c1y}}, ${{c2x}} ${{c2y}}, ${{x2}} ${{y2}}`;
+        const p = edgePathEls.get(edgeId);
+        const a = edgeArrowEls.get(edgeId);
+        if (p) p.setAttribute('d', d);
+        if (a) a.setAttribute('points', arrowPoints(x2, y2, c2x, c2y, 11.5));
+      }};
+
+      const rerouteConnectedEdges = (name) => {{
+        edgeMeta.forEach((e, edgeId) => {{
+          if (e.source === name || e.target === name) rerouteEdgeById(edgeId);
+        }});
+      }};
+
+      // Normalize first paint to the same smooth cubic routing used during drag.
+      // This avoids the initial ELK polyline look before any interaction.
+      edgeMeta.forEach((_e, edgeId) => rerouteEdgeById(edgeId));
+
+      const pt = svg.createSVGPoint();
+      const toSvgPoint = (clientX, clientY) => {{
+        pt.x = clientX; pt.y = clientY;
+        const m = svg.getScreenCTM();
+        return m ? pt.matrixTransform(m.inverse()) : {{ x: clientX, y: clientY }};
+      }};
+      let drag = null;
+      let suppressNodeClickUntil = 0;
+      nodeRectMap.forEach((rect, name) => {{
+        rect.addEventListener('mousedown', (ev) => {{
+          ev.preventDefault();
+          const s = getState(name);
+          if (!s) return;
+          const p = toSvgPoint(ev.clientX, ev.clientY);
+          drag = {{ name, dx: p.x - s.cx, dy: p.y - s.cy, startX: ev.clientX, startY: ev.clientY, moved: false }};
+          rect.style.cursor = 'grabbing';
+        }});
+        rect.addEventListener('click', (ev) => {{
+          if (Date.now() < suppressNodeClickUntil) return;
+          ev.stopPropagation();
+          const node = nodeByName.get(name);
+          renderArtifactPanel(node);
+        }});
+        rect.addEventListener('dblclick', (ev) => {{
+          ev.stopPropagation();
+          const node = nodeByName.get(name);
+          if (!node) return;
+          const href = node.primary_artifact_href || node.primary_preview_href;
+          if (href) window.open(href, '_blank', 'noopener,noreferrer');
+        }});
+      }});
+      window.addEventListener('mousemove', (ev) => {{
+        if (!drag) return;
+        const p = toSvgPoint(ev.clientX, ev.clientY);
+        const movedPx = Math.hypot(ev.clientX - drag.startX, ev.clientY - drag.startY);
+        if (movedPx > 4) drag.moved = true;
+        setState(drag.name, p.x - drag.dx, p.y - drag.dy);
+        rerouteConnectedEdges(drag.name);
+      }});
+      window.addEventListener('mouseup', () => {{
+        if (!drag) return;
+        const r = nodeRectMap.get(drag.name);
+        if (r) r.style.cursor = 'grab';
+        if (drag.moved) suppressNodeClickUntil = Date.now() + 200;
+        drag = null;
+      }});
+      svg.addEventListener('click', () => closeArtifactPanel());
+    }}
+
     function sortTable(col, numeric) {{
       const table = document.getElementById('nodeTable');
       const rows = Array.from(table.querySelectorAll('tbody tr'));
@@ -427,178 +1004,18 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
       sorted.forEach(r => body.appendChild(r));
     }}
 
-    (function setupDagTooltip() {{
-      const tooltip = document.getElementById('dagTooltip');
-      const hoverEls = document.querySelectorAll('.dag-hover[data-tooltip]');
-      const renderTooltip = (raw) => {{
-        const lines = String(raw || '').split('\\n');
-        const html = lines.map((line) => {{
-          const idx = line.indexOf(':');
-          if (idx > 0) {{
-            const k = line.slice(0, idx + 1);
-            const v = line.slice(idx + 1);
-            if (k === 'Node:') {{
-              return `<div class="row"><span class="k">${{k}}</span><b>${{v}}</b></div>`;
-            }}
-            return `<div class="row"><span class="k">${{k}}</span>${{v}}</div>`;
-          }}
-          return `<div class="row">${{line}}</div>`;
-        }}).join('');
-        tooltip.innerHTML = html;
-      }};
-      const move = (ev) => {{
-        const x = ev.clientX + 14;
-        const y = ev.clientY + 14;
-        tooltip.style.left = x + 'px';
-        tooltip.style.top = y + 'px';
-      }};
-      hoverEls.forEach((el) => {{
-        el.addEventListener('mouseenter', (ev) => {{
-          renderTooltip(el.getAttribute('data-tooltip'));
-          tooltip.style.display = 'block';
-          move(ev);
-        }});
-        el.addEventListener('mousemove', move);
-        el.addEventListener('mouseleave', () => {{
-          tooltip.style.display = 'none';
-        }});
-      }});
-    }})();
-
-    (function setupDagDrag() {{
-      const svg = document.querySelector('svg');
-      if (!svg) return;
-      const nodeEls = Array.from(svg.querySelectorAll('.dag-node[data-node]'));
-      const edgePathEls = Array.from(svg.querySelectorAll('.dag-edge-path[data-edge-id]'));
-      const edgeArrowEls = Array.from(svg.querySelectorAll('.dag-edge-arrow[data-edge-id]'));
-      const edgePathById = new Map();
-      const edgeArrowById = new Map();
-      edgePathEls.forEach((el) => edgePathById.set(el.getAttribute('data-edge-id'), el));
-      edgeArrowEls.forEach((el) => edgeArrowById.set(el.getAttribute('data-edge-id'), el));
-      const labelMap = new Map();
-      const subMap = new Map();
-      svg.querySelectorAll('text[data-node-label]').forEach((el) => labelMap.set(el.getAttribute('data-node-label'), el));
-      svg.querySelectorAll('text[data-node-sub]').forEach((el) => subMap.set(el.getAttribute('data-node-sub'), el));
-
-      const nodeMap = new Map();
-      nodeEls.forEach((el) => nodeMap.set(el.getAttribute('data-node'), el));
-
-      const getState = (name) => {{
-        const rect = nodeMap.get(name);
-        if (!rect) return null;
-        return {{
-          cx: parseFloat(rect.getAttribute('data-cx') || '0'),
-          cy: parseFloat(rect.getAttribute('data-cy') || '0'),
-          w: parseFloat(rect.getAttribute('data-w') || '0'),
-          h: parseFloat(rect.getAttribute('data-h') || '0'),
-        }};
-      }};
-
-      const setState = (name, cx, cy) => {{
-        const rect = nodeMap.get(name);
-        if (!rect) return;
-        const w = parseFloat(rect.getAttribute('data-w') || '0');
-        const h = parseFloat(rect.getAttribute('data-h') || '0');
-        rect.setAttribute('data-cx', String(cx));
-        rect.setAttribute('data-cy', String(cy));
-        rect.setAttribute('x', String(cx - w / 2));
-        rect.setAttribute('y', String(cy - h / 2));
-        const label = labelMap.get(name);
-        if (label) {{
-          label.setAttribute('x', String(cx));
-          label.setAttribute('y', String(cy - 6));
+    (async function initDag() {{
+      const dims = buildDims(manifestNodes);
+      try {{
+        const layout = await elkLayout(manifestNodes, manifestEdges, dims, manifestLayout);
+        if (!layout) throw new Error('ELK layout unavailable');
+        renderDag(layout, manifestNodes, manifestEdges, dims);
+      }} catch (err) {{
+        const card = document.querySelector('.card');
+        if (card) {{
+          card.innerHTML = `<div style="padding:16px;color:#fca5a5;">Failed to initialize ELK DAG layout. Please check network access for elkjs bundle.</div>`;
         }}
-        const sub = subMap.get(name);
-        if (sub) {{
-          sub.setAttribute('x', String(cx));
-          sub.setAttribute('y', String(cy + 14));
-        }}
-      }};
-
-      const arrowPoints = (x2, y2, c2x, c2y, size = 11.5) => {{
-        const angle = Math.atan2(y2 - c2y, x2 - c2x);
-        const ux = Math.cos(angle);
-        const uy = Math.sin(angle);
-        const bx = x2 - ux * size;
-        const by = y2 - uy * size;
-        const px = -uy;
-        const py = ux;
-        const w = size * 0.6;
-        const lx = bx + px * w;
-        const ly = by + py * w;
-        const rx = bx - px * w;
-        const ry = by - py * w;
-        return `${{x2}},${{y2}} ${{lx}},${{ly}} ${{rx}},${{ry}}`;
-      }};
-
-      const rerouteEdgeById = (edgeId) => {{
-        const edgeEl = edgePathById.get(edgeId);
-        if (!edgeEl) return;
-        const source = edgeEl.getAttribute('data-source');
-        const target = edgeEl.getAttribute('data-target');
-        const src = getState(source);
-        const dst = getState(target);
-        if (!src || !dst) return;
-        const x1 = src.cx + src.w / 2;
-        const y1 = src.cy;
-        const x2 = dst.cx - dst.w / 2;
-        const y2 = dst.cy;
-        const dx = Math.max((x2 - x1) * 0.45, 40.0);
-        const c1x = x1 + dx;
-        const c1y = y1 + (y2 - y1) * 0.2;
-        const c2x = x2 - dx;
-        const c2y = y2 - (y2 - y1) * 0.2;
-        edgeEl.setAttribute('d', `M ${{x1}} ${{y1}} C ${{c1x}} ${{c1y}}, ${{c2x}} ${{c2y}}, ${{x2}} ${{y2}}`);
-        const arrowEl = edgeArrowById.get(edgeId);
-        if (arrowEl) {{
-          arrowEl.setAttribute('points', arrowPoints(x2, y2, c2x, c2y));
-        }}
-      }};
-
-      const rerouteConnectedEdges = (name) => {{
-        edgePathEls.forEach((edgeEl) => {{
-          if (edgeEl.getAttribute('data-source') === name || edgeEl.getAttribute('data-target') === name) {{
-            rerouteEdgeById(edgeEl.getAttribute('data-edge-id'));
-          }}
-        }});
-      }};
-
-      let drag = null;
-      const pt = svg.createSVGPoint();
-      const toSvgPoint = (clientX, clientY) => {{
-        pt.x = clientX;
-        pt.y = clientY;
-        const m = svg.getScreenCTM();
-        return m ? pt.matrixTransform(m.inverse()) : {{ x: clientX, y: clientY }};
-      }};
-
-      nodeEls.forEach((rect) => {{
-        rect.addEventListener('mousedown', (ev) => {{
-          ev.preventDefault();
-          const name = rect.getAttribute('data-node');
-          const s = getState(name);
-          if (!s) return;
-          const p = toSvgPoint(ev.clientX, ev.clientY);
-          drag = {{ name, dx: p.x - s.cx, dy: p.y - s.cy }};
-          rect.style.cursor = 'grabbing';
-        }});
-      }});
-
-      window.addEventListener('mousemove', (ev) => {{
-        if (!drag) return;
-        const p = toSvgPoint(ev.clientX, ev.clientY);
-        const nx = p.x - drag.dx;
-        const ny = p.y - drag.dy;
-        setState(drag.name, nx, ny);
-        rerouteConnectedEdges(drag.name);
-      }});
-
-      window.addEventListener('mouseup', () => {{
-        if (!drag) return;
-        const rect = nodeMap.get(drag.name);
-        if (rect) rect.style.cursor = 'grab';
-        drag = null;
-      }});
+      }}
     }})();
   </script>
 </body>
@@ -626,20 +1043,25 @@ def write_report_bundle(report_cfg: Dict[str, Any], manifest: Dict[str, Any]) ->
     run_id = manifest["run_id"]
     written: Dict[str, str] = {}
     fmt = report_cfg["format"]
+    enriched_manifest = _build_enriched_manifest(
+        manifest=manifest,
+        output_dir=output_dir,
+        include_previews=fmt in {"html", "both"},
+    )
 
     if fmt in {"json", "both"}:
         json_path = output_dir / f"{run_id}.json"
-        _write_json(json_path, manifest)
+        _write_json(json_path, enriched_manifest)
         written["json"] = str(json_path)
         prune_old_reports(output_dir, report_cfg["keep_last_n"], ".json")
         if report_cfg["write_latest_pointer"]:
             latest_json = output_dir / "latest.json"
-            _write_json(latest_json, manifest)
+            _write_json(latest_json, enriched_manifest)
             written["latest_json"] = str(latest_json)
 
     if fmt in {"html", "both"}:
         html_path = output_dir / f"{run_id}.html"
-        render_html_report(manifest, html_path)
+        render_html_report(enriched_manifest, html_path)
         written["html"] = str(html_path)
         prune_old_reports(output_dir, report_cfg["keep_last_n"], ".html")
         if report_cfg["write_latest_pointer"]:

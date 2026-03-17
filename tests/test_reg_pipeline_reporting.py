@@ -37,6 +37,11 @@ def _strict_cfg() -> dict:
                 "keep_last_n": 2,
                 "include_edge_payloads": True,
                 "write_latest_pointer": True,
+                "layout": {
+                    "node_spacing": 55,
+                    "layer_spacing": 120,
+                    "edge_node_spacing": 30,
+                },
             }
         },
     }
@@ -69,10 +74,13 @@ def test_pipeline_report_outputs_and_retention(tmp_path):
     assert "source" in latest_html
     assert "sink" in latest_html
     assert "Refreshed" in latest_html
+    assert "artifactPanel" in latest_html
+    assert "renderArtifactPanel" in latest_html
 
     latest_json = json.loads((report_dir / "latest.json").read_text(encoding="utf-8"))
     assert latest_json["nodes"]
     assert all(isinstance(node.get("refreshed"), bool) for node in latest_json["nodes"])
+    assert any(isinstance(node.get("artifact_links"), list) for node in latest_json["nodes"])
 
 
 def test_cli_pipeline_report_overrides():

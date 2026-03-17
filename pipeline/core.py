@@ -245,6 +245,7 @@ class ResearchPipeline:
         output_bytes_by_node = {row["name"]: row.get("output_total_bytes") for row in nodes_rows}
         edges: List[Dict[str, Any]] = []
         include_edge_payloads = bool(self._runtime_options["pipeline_report"]["include_edge_payloads"])
+        layout_cfg = dict(self._runtime_options["pipeline_report"].get("layout") or {})
         for target in sorted(required):
             for source in self.nodes[target].inputs:
                 if source not in required:
@@ -283,6 +284,11 @@ class ResearchPipeline:
             "config_hashes": {sec: self.get_config_hash(config, sec) for sec in sorted(config.keys())},
             "summary": summary,
             "top_bottlenecks": top_bottlenecks,
+            "layout": {
+                "node_spacing": float(layout_cfg.get("node_spacing", 55.0)),
+                "layer_spacing": float(layout_cfg.get("layer_spacing", 120.0)),
+                "edge_node_spacing": float(layout_cfg.get("edge_node_spacing", 30.0)),
+            },
             "nodes": nodes_rows,
             "edges": edges,
         }
