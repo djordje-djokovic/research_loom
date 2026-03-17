@@ -12,6 +12,7 @@ import contextlib
 import logging
 import io
 import re
+import os
 from collections import deque
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Set, Union, Sequence, Callable
@@ -19,6 +20,12 @@ from dataclasses import dataclass
 from functools import lru_cache
 import shutil
 import yaml
+from research_loom.pipeline.reporting import (
+    create_run_id,
+    utc_now_iso,
+    validate_report_config,
+    write_report_bundle,
+)
 
 # Optional imports for artifact handling
 try:
@@ -79,6 +86,18 @@ class ResearchPipeline:
         self.redact_config = redact_config or (lambda sec, cfg: cfg)
         self._recent_cache_keys = set()  # Track recently used cache keys
         self._recent_queue = deque(maxlen=512)  # Bounded LRU for recent keys
+        self._runtime_options = {
+            "heartbeat_interval_seconds": None,
+            "large_artifact_threshold_mb": 8,
+            "big_object_list_min_items": 1000,
+            "skip_full_payload_validation": False,
+            "save_chunk_bytes": 4 * 1024 * 1024,
+            "pipeline_report": None,
+        }
+        self._last_node_timings: Dict[str, Dict[str, Any]] = {}
+        self._run_node_io: Dict[str, Dict[str, Any]] = {}
+        self._run_context: Dict[str, Any] = {}
+        self._last_report_paths: Dict[str, str] = {}
     
     def _setup_default_logger(self) -> logging.Logger:
         """Setup default logger with pretty output"""
@@ -91,6 +110,212 @@ class ResearchPipeline:
             logger.setLevel(logging.INFO)
         logger.propagate = False  # Prevent double-printing
         return logger
+
+    def _refresh_runtime_options(self, config: Dict[str, Any]) -> None:
+        """Refresh runtime options from config with safe defaults."""
+        logging_cfg = config.get("logging", {}) if isinstance(config, dict) else {}
+        results_cfg = config.get("results", {}) if isinstance(config, dict) else {}
+        heartbeat = logging_cfg.get("heartbeat_interval_seconds")
+        self._runtime_options["heartbeat_interval_seconds"] = float(heartbeat) if heartbeat is not None else None
+        self._runtime_options["large_artifact_threshold_mb"] = float(results_cfg.get("large_artifact_threshold_mb", 8))
+        self._runtime_options["big_object_list_min_items"] = int(results_cfg.get("big_object_list_min_items", 1000))
+        self._runtime_options["skip_full_payload_validation"] = bool(
+            results_cfg.get("skip_full_payload_validation", False)
+        )
+        self._runtime_options["save_chunk_bytes"] = int(results_cfg.get("save_chunk_bytes", 4 * 1024 * 1024))
+        report_cfg = logging_cfg.get("pipeline_report")
+        validated = validate_report_config(report_cfg)
+        validated["output_dir"] = str(self._resolve_report_output_dir(validated["output_dir"]))
+        self._runtime_options["pipeline_report"] = validated
+
+    def _resolve_report_output_dir(self, output_dir: str) -> Path:
+        p = Path(output_dir)
+        if p.is_absolute():
+            return p
+        return (self.cache_dir / p).resolve()
+
+    def _heartbeat_interval(self) -> Optional[float]:
+        value = self._runtime_options.get("heartbeat_interval_seconds")
+        if value is None:
+            return None
+        try:
+            parsed = float(value)
+        except Exception:
+            return None
+        return parsed if parsed > 0 else None
+
+    def _log_elapsed_summary(self, node_timings: Dict[str, Dict[str, Any]]) -> None:
+        """Emit a compact per-node elapsed-time summary sorted by duration."""
+        if not node_timings:
+            return
+        rows = sorted(node_timings.items(), key=lambda item: item[1].get("elapsed_s", 0.0), reverse=True)
+        self.logger.info("\nNODE ELAPSED SUMMARY:")
+        for node_name, row in rows:
+            self.logger.info(f"  {node_name}: {row.get('elapsed_s', 0.0):.2f}s ({row.get('status', 'unknown')})")
+
+    def _iter_artifact_ptrs(self, payload: Any):
+        if isinstance(payload, dict):
+            if payload.get("__artifact__") is True and "path" in payload:
+                yield payload
+                return
+            for value in payload.values():
+                yield from self._iter_artifact_ptrs(value)
+            return
+        if isinstance(payload, (list, tuple)):
+            for item in payload:
+                yield from self._iter_artifact_ptrs(item)
+
+    def _artifact_info(self, ptr: Dict[str, Any], io_role: str, input_name: Optional[str] = None) -> Dict[str, Any]:
+        rel_path = str(ptr.get("path"))
+        abs_path = (self.cache_dir / rel_path).resolve()
+        size_bytes = abs_path.stat().st_size if abs_path.exists() else None
+        info = {
+            "io_role": io_role,
+            "input_name": input_name,
+            "key": ptr.get("key"),
+            "format": ptr.get("format"),
+            "path": rel_path,
+            "abs_path": str(abs_path),
+            "bytes": size_bytes,
+        }
+        return info
+
+    def _collect_output_artifacts(self, payload: Any) -> List[Dict[str, Any]]:
+        return [self._artifact_info(ptr, io_role="output") for ptr in self._iter_artifact_ptrs(payload)]
+
+    def _collect_input_artifacts(self, inputs: Dict[str, Any]) -> List[Dict[str, Any]]:
+        refs: List[Dict[str, Any]] = []
+        for input_name, value in inputs.items():
+            for ptr in self._iter_artifact_ptrs(value):
+                refs.append(self._artifact_info(ptr, io_role="input", input_name=input_name))
+        return refs
+
+    def _cache_file_info(self, node_name: str, cache_key: str) -> Dict[str, Any]:
+        cache_path = self.get_cache_path(node_name, cache_key)
+        return {
+            "cache_file_path": str(cache_path.resolve()),
+            "cache_file_bytes": cache_path.stat().st_size if cache_path.exists() else None,
+        }
+
+    def _record_node_io(self, node_name: str, cache_key: str, input_artifacts: List[Dict[str, Any]], output_payload: Any) -> None:
+        output_artifacts = self._collect_output_artifacts(output_payload)
+        output_total = sum(item.get("bytes", 0) or 0 for item in output_artifacts)
+        input_total = sum(item.get("bytes", 0) or 0 for item in input_artifacts)
+        io_data = {
+            "input_artifacts": input_artifacts,
+            "output_artifacts": output_artifacts,
+            "input_total_bytes": input_total,
+            "output_total_bytes": output_total,
+        }
+        io_data.update(self._cache_file_info(node_name, cache_key))
+        self._run_node_io[node_name] = io_data
+
+    def _build_run_manifest(
+        self,
+        config: Dict[str, Any],
+        original_materialize: Union[str, Sequence[str]],
+        outputs: List[str],
+        required: Set[str],
+        execution_plan: Dict[str, str],
+        run_status: str,
+        error_message: Optional[str],
+        elapsed_s: float,
+    ) -> Dict[str, Any]:
+        nodes_rows: List[Dict[str, Any]] = []
+        reason_map = self._run_context.get("reason_map", {})
+        for node_name in sorted(required):
+            timing = self._last_node_timings.get(node_name, {})
+            io_data = self._run_node_io.get(node_name, {})
+            node_status = timing.get("status", "unknown")
+            row = {
+                "name": node_name,
+                "status": node_status,
+                "refreshed": node_status == "computed",
+                "reason": reason_map.get(node_name) or execution_plan.get(node_name, "UNKNOWN"),
+                "elapsed_s": float(timing.get("elapsed_s", 0.0)),
+                "input_artifacts": io_data.get("input_artifacts", []),
+                "output_artifacts": io_data.get("output_artifacts", []),
+                "input_total_bytes": io_data.get("input_total_bytes"),
+                "output_total_bytes": io_data.get("output_total_bytes"),
+                "cache_file_path": io_data.get("cache_file_path"),
+                "cache_file_bytes": io_data.get("cache_file_bytes"),
+            }
+            nodes_rows.append(row)
+
+        output_bytes_by_node = {row["name"]: row.get("output_total_bytes") for row in nodes_rows}
+        edges: List[Dict[str, Any]] = []
+        include_edge_payloads = bool(self._runtime_options["pipeline_report"]["include_edge_payloads"])
+        for target in sorted(required):
+            for source in self.nodes[target].inputs:
+                if source not in required:
+                    continue
+                edge = {"source": source, "target": target}
+                if include_edge_payloads:
+                    edge["payload_bytes"] = output_bytes_by_node.get(source)
+                edges.append(edge)
+
+        n_computed = sum(1 for row in nodes_rows if row["status"] == "computed")
+        n_cached = sum(1 for row in nodes_rows if row["status"] == "cached")
+        n_failed = sum(1 for row in nodes_rows if row["status"] == "failed")
+        summary = {
+            "n_nodes": len(nodes_rows),
+            "n_edges": len(edges),
+            "n_computed": n_computed,
+            "n_cached": n_cached,
+            "n_failed": n_failed,
+        }
+        top_bottlenecks = [
+            {"name": row["name"], "elapsed_s": row["elapsed_s"]}
+            for row in sorted(nodes_rows, key=lambda item: item["elapsed_s"], reverse=True)[:5]
+        ]
+        return {
+            "run_id": self._run_context.get("run_id"),
+            "project_name": os.path.basename(os.getcwd()),
+            "started_at": self._run_context.get("started_at"),
+            "ended_at": utc_now_iso(),
+            "elapsed_s": elapsed_s,
+            "run_status": run_status,
+            "error": error_message,
+            "cache_dir": str(self.cache_dir.resolve()),
+            "materialize": original_materialize if isinstance(original_materialize, str) else list(original_materialize),
+            "outputs": outputs,
+            "required_nodes": sorted(required),
+            "config_hashes": {sec: self.get_config_hash(config, sec) for sec in sorted(config.keys())},
+            "summary": summary,
+            "top_bottlenecks": top_bottlenecks,
+            "nodes": nodes_rows,
+            "edges": edges,
+        }
+
+    def _emit_pipeline_report(
+        self,
+        config: Dict[str, Any],
+        original_materialize: Union[str, Sequence[str]],
+        outputs: List[str],
+        required: Set[str],
+        execution_plan: Dict[str, str],
+        run_status: str,
+        error_message: Optional[str],
+        elapsed_s: float,
+    ) -> None:
+        report_cfg = self._runtime_options.get("pipeline_report")
+        if not report_cfg or not report_cfg.get("enabled"):
+            self._last_report_paths = {}
+            return
+        manifest = self._build_run_manifest(
+            config=config,
+            original_materialize=original_materialize,
+            outputs=outputs,
+            required=required,
+            execution_plan=execution_plan,
+            run_status=run_status,
+            error_message=error_message,
+            elapsed_s=elapsed_s,
+        )
+        written = write_report_bundle(report_cfg, manifest)
+        self._last_report_paths = written
+        if written:
+            self.logger.info(f"[REPORT] Wrote pipeline report artifacts: {written}")
     
     def _mark_recent(self, node_name: str, cache_key: str):
         """Mark a cache key as recently used with bounded LRU"""
@@ -214,16 +439,19 @@ class ResearchPipeline:
         """Check if value is a large nested dict"""
         if not isinstance(val, dict):
             return False
-        # Rough size estimate (8MB threshold)
+        # Rough size estimate with configurable threshold.
+        threshold_mb = float(self._runtime_options.get("large_artifact_threshold_mb", 8))
+        threshold_bytes = int(max(threshold_mb, 0) * 1024 * 1024)
         try:
             size = len(json.dumps(val, default=str))
-            return size > 8 * 1024 * 1024  # 8MB
+            return size > threshold_bytes
         except:
             return False
     
     def _is_big_object_list(self, val) -> bool:
         """Check if value is a big list of objects"""
-        if not isinstance(val, list) or len(val) < 1000:
+        min_items = int(self._runtime_options.get("big_object_list_min_items", 1000))
+        if not isinstance(val, list) or len(val) < min_items:
             return False
         # Check if it's a list of dicts/objects
         return all(isinstance(item, (dict, list)) for item in val[:10])
@@ -310,12 +538,26 @@ class ResearchPipeline:
 
         try:
             self.logger.info(f"[PHASE: SAVE] Compressing and writing {key} to {path}...")
-            with open(path, "wb") as f:
-                cctx = zstd.ZstdCompressor()
-                compressed = cctx.compress(json_bytes)
-                f.write(compressed)
+            heartbeat_interval = self._heartbeat_interval()
+            chunk_bytes = max(int(self._runtime_options.get("save_chunk_bytes", 4 * 1024 * 1024)), 64 * 1024)
+            total_bytes = len(json_bytes)
+            written_bytes = 0
+            last_heartbeat = time.time()
+            cctx = zstd.ZstdCompressor()
+            with open(path, "wb") as f, cctx.stream_writer(f) as writer:
+                for offset in range(0, total_bytes, chunk_bytes):
+                    chunk = json_bytes[offset : offset + chunk_bytes]
+                    writer.write(chunk)
+                    written_bytes += len(chunk)
+                    if heartbeat_interval is not None and (time.time() - last_heartbeat) >= heartbeat_interval:
+                        pct = (written_bytes / total_bytes) * 100 if total_bytes else 100.0
+                        self.logger.info(
+                            f"[PHASE: SAVE] Heartbeat {key}: {written_bytes}/{total_bytes} bytes ({pct:.1f}%) written"
+                        )
+                        last_heartbeat = time.time()
+            compressed_size = path.stat().st_size if path.exists() else 0
             self.logger.info(
-                f"[PHASE: SAVE] Successfully saved {key} as json.zst: {len(compressed)} bytes compressed from {len(json_bytes)} bytes"
+                f"[PHASE: SAVE] Successfully saved {key} as json.zst: {compressed_size} bytes compressed from {len(json_bytes)} bytes"
             )
         except IOError as e:
             self.logger.error(f"[PHASE: SAVE] IOError saving {key} as json.zst to {path}: {e}")
@@ -331,16 +573,28 @@ class ResearchPipeline:
 
     def _save_jsonl_zst_payload(self, val: Any, path: Path, key: str) -> None:
         """Serialize/compress JSON lines payload to .jsonl.zst."""
-        self.logger.info(f"[PHASE: SAVE] Starting jsonl.zst save for {key} (streaming, {len(val)} items)")
+        total_items = len(val) if hasattr(val, "__len__") else None
+        self.logger.info(
+            f"[PHASE: SAVE] Starting jsonl.zst save for {key} (streaming, {total_items if total_items is not None else 'unknown'} items)"
+        )
         try:
             cctx = zstd.ZstdCompressor()
             item_count = 0
+            heartbeat_interval = self._heartbeat_interval()
+            last_heartbeat = time.time()
             with open(path, "wb") as f, cctx.stream_writer(f) as writer:
                 for item in val:
                     writer.write((json.dumps(item, default=str) + "\n").encode())
                     item_count += 1
-                    if item_count % 1000 == 0:
-                        self.logger.debug(f"[PHASE: SAVE] Written {item_count}/{len(val)} items to jsonl.zst")
+                    if heartbeat_interval is not None and (time.time() - last_heartbeat) >= heartbeat_interval:
+                        if total_items:
+                            pct = (item_count / total_items) * 100
+                            self.logger.info(
+                                f"[PHASE: SAVE] Heartbeat {key}: {item_count}/{total_items} items ({pct:.1f}%) written"
+                            )
+                        else:
+                            self.logger.info(f"[PHASE: SAVE] Heartbeat {key}: {item_count} items written")
+                        last_heartbeat = time.time()
             self.logger.info(f"[PHASE: SAVE] Successfully saved {key} as jsonl.zst: {item_count} items")
         except MemoryError as e:
             self.logger.error(f"[PHASE: SAVE] MemoryError during jsonl.zst streaming for {key}: {e}")
@@ -510,33 +764,8 @@ class ResearchPipeline:
             if not HAS_ZSTD:
                 self.logger.debug(f"zstandard not available, storing {key} inline")
                 return val  # fallback to inline
-            
-            path = artifacts_dir / f"{stem}.json.zst"
             try:
-                import json
-                # Test JSON serialization first
-                try:
-                    json_str = json.dumps(val, default=str)
-                    json_bytes = json_str.encode('utf-8')
-                    self.logger.debug(f"JSON serialization for {key}: {len(json_bytes)} bytes")
-                except Exception as json_err:
-                    self.logger.warning(f"JSON serialization failed for {key}: {type(json_err).__name__}: {json_err}")
-                    return val  # fallback to inline
-                
-                # Compress and write
-                try:
-                    with open(path, 'wb') as f:
-                        cctx = zstd.ZstdCompressor()
-                        compressed = cctx.compress(json_bytes)
-                        f.write(compressed)
-                    self.logger.debug(f"Successfully saved {key} as json.zst: {len(compressed)} bytes compressed")
-                    return self._artifact_ptr("json.zst", self.cache_dir, path, key)
-                except IOError as io_err:
-                    self.logger.warning(f"IOError saving {key} as json.zst to {path}: {io_err}")
-                    return val  # fallback to inline
-                except Exception as comp_err:
-                    self.logger.warning(f"Compression/write error for {key}: {type(comp_err).__name__}: {comp_err}")
-                    return val  # fallback to inline
+                return self._spill_with_format(val, artifacts_dir, stem, key, "json.zst")
             except Exception as e:
                 self.logger.warning(f"Unexpected error saving {key} as json.zst: {type(e).__name__}: {e}")
                 return val  # fallback to inline
@@ -545,14 +774,8 @@ class ResearchPipeline:
         if self._is_big_object_list(val):
             if not HAS_ZSTD:
                 return val  # fallback to inline
-            
-            path = artifacts_dir / f"{stem}.jsonl.zst"
             try:
-                cctx = zstd.ZstdCompressor()
-                with open(path, 'wb') as f, cctx.stream_writer(f) as writer:
-                    for item in val:
-                        writer.write((json.dumps(item, default=str) + '\n').encode())
-                return self._artifact_ptr("jsonl.zst", self.cache_dir, path, key)
+                return self._spill_with_format(val, artifacts_dir, stem, key, "jsonl.zst")
             except Exception:
                 return val  # fallback to inline
         
@@ -581,10 +804,10 @@ class ResearchPipeline:
             elif fmt == "json.zst":
                 if not HAS_ZSTD:
                     raise ValueError("zstandard not available")
-                with open(path, 'rb') as f:
-                    dctx = zstd.ZstdDecompressor()
-                    decompressed = dctx.decompress(f.read())
-                    return json.loads(decompressed.decode())
+                dctx = zstd.ZstdDecompressor()
+                with open(path, "rb") as f, dctx.stream_reader(f) as reader:
+                    decompressed = reader.read()
+                return json.loads(decompressed.decode("utf-8"))
             
             elif fmt == "jsonl.zst":
                 if not HAS_ZSTD:
@@ -618,6 +841,8 @@ class ResearchPipeline:
         if not cache_path.exists():
             return False
         try:
+            if self._runtime_options.get("skip_full_payload_validation", False):
+                return cache_path.stat().st_size > 0
             # Validate cache is parseable JSON to avoid treating corrupted
             # non-empty files as valid cache entries.
             with open(cache_path, "r", encoding="utf-8") as f:
@@ -646,7 +871,14 @@ class ResearchPipeline:
             # Handle old format
             return data
     
-    def save_cache(self, node_name: str, cache_key: str, result: Any, config: Dict = None):
+    def save_cache(
+        self,
+        node_name: str,
+        cache_key: str,
+        result: Any,
+        config: Dict = None,
+        input_artifacts: Optional[List[Dict[str, Any]]] = None,
+    ):
         """Save result to cache atomically with provenance metadata and file locking"""
         final = self.get_cache_path(node_name, cache_key)
         tmp = final.with_suffix(final.suffix + ".tmp")
@@ -730,6 +962,12 @@ class ResearchPipeline:
                 except Exception:
                     pass
             tmp.replace(final)  # atomic on same filesystem
+            self._record_node_io(
+                node_name=node_name,
+                cache_key=cache_key,
+                input_artifacts=input_artifacts or [],
+                output_payload=processed_result,
+            )
         finally:
             with contextlib.suppress(Exception):
                 lock.unlink()
@@ -860,7 +1098,13 @@ class ResearchPipeline:
         
         return required
     
-    def execute_node(self, node_name: str, config: Dict, inputs: Dict[str, Any]) -> Any:
+    def execute_node(
+        self,
+        node_name: str,
+        config: Dict,
+        inputs: Dict[str, Any],
+        input_artifacts: Optional[List[Dict[str, Any]]] = None,
+    ) -> Any:
         """Execute a single node"""
         cache_key = self.get_node_cache_key(config, node_name)
         
@@ -869,7 +1113,14 @@ class ResearchPipeline:
             self.logger.info(f"    {node_name}: [LOADED FROM CACHE] - Using cached result")
             # Track this cache key as recently used
             self._mark_recent(node_name, cache_key)
-            return self.load_cache(node_name, cache_key)
+            cached_value = self.load_cache(node_name, cache_key)
+            self._record_node_io(
+                node_name=node_name,
+                cache_key=cache_key,
+                input_artifacts=input_artifacts or [],
+                output_payload=cached_value,
+            )
+            return cached_value
         
         self.logger.info(f"    {node_name}: [PROCESSING] - Computing new result")
         
@@ -885,7 +1136,13 @@ class ResearchPipeline:
         dt = time.time() - t0
         
         # Persist in 'wire format' (with artifact pointers) and return the same shape
-        self.save_cache(node_name, cache_key, result, config)
+        self.save_cache(
+            node_name=node_name,
+            cache_key=cache_key,
+            result=result,
+            config=config,
+            input_artifacts=input_artifacts,
+        )
         self._mark_recent(node_name, cache_key)
         self.logger.info(f"    {node_name}: [SAVED TO CACHE] - Result cached for future use ({dt:.3f}s)")
         return self.load_cache(node_name, cache_key)
@@ -927,6 +1184,7 @@ class ResearchPipeline:
         key = self.get_node_cache_key(config, node_name)
         value = self.load_cache(node_name, key)
         self._mark_recent(node_name, key)
+        self._record_node_io(node_name=node_name, cache_key=key, input_artifacts=[], output_payload=value)
         return value
 
     def _log_execution_plan(self, config: Dict, execution_plan: Dict[str, str]) -> None:
@@ -960,20 +1218,46 @@ class ResearchPipeline:
         if any(execution_plan[n] == "CACHED" for n in filtered_order):
             self.logger.info(f"LOADING {sum(execution_plan[n]=='CACHED' for n in filtered_order)} NODES FROM CACHE:")
 
+        node_timings: Dict[str, Dict[str, Any]] = {}
         for n in filtered_order:
-            if execution_plan[n] == "MISSING":
-                ins = {}
-                for i in self.nodes[n].inputs:
-                    val = results[i]
-                    if isinstance(val, dict) and val.get("__artifact__"):
-                        ins[i] = self._load_artifact(val)
-                    else:
-                        ins[i] = val
-                results[n] = self.execute_node(n, config, ins)
-            else:
-                results[n] = self._load_node_from_cache(config, n)
-                self.logger.info(f"    {n}: [LOADED FROM CACHE]")
+            node_start = time.time()
+            reason = self._run_context.get("reason_map", {}).get(n)
+            try:
+                if execution_plan[n] == "MISSING":
+                    ins = {}
+                    input_artifacts: List[Dict[str, Any]] = []
+                    for i in self.nodes[n].inputs:
+                        val = results[i]
+                        if isinstance(val, dict) and val.get("__artifact__"):
+                            input_artifacts.append(self._artifact_info(val, io_role="input", input_name=i))
+                            ins[i] = self._load_artifact(val)
+                        else:
+                            ins[i] = val
+                    results[n] = self.execute_node(n, config, ins, input_artifacts=input_artifacts)
+                    node_timings[n] = {
+                        "status": "computed",
+                        "elapsed_s": time.time() - node_start,
+                        "reason": reason,
+                    }
+                else:
+                    results[n] = self._load_node_from_cache(config, n)
+                    self.logger.info(f"    {n}: [LOADED FROM CACHE]")
+                    node_timings[n] = {
+                        "status": "cached",
+                        "elapsed_s": time.time() - node_start,
+                        "reason": reason,
+                    }
+            except Exception as err:
+                node_timings[n] = {
+                    "status": "failed",
+                    "elapsed_s": time.time() - node_start,
+                    "reason": reason,
+                    "error": f"{type(err).__name__}: {err}",
+                }
+                self._last_node_timings = node_timings
+                raise
 
+        self._last_node_timings = node_timings
         return results
     
     def run_pipeline(self, config: Dict, materialize: Union[str, Sequence[str]] = "sinks") -> Dict[str, Any]:
@@ -987,65 +1271,160 @@ class ResearchPipeline:
         self.logger.info("="*80)
         self.logger.info("RESEARCH PIPELINE EXECUTION")
         self.logger.info("="*80)
+        self._refresh_runtime_options(config)
+        self._last_node_timings = {}
+        self._run_node_io = {}
+        run_started = time.time()
+        self._run_context = {
+            "run_id": create_run_id(),
+            "started_at": utc_now_iso(),
+            "reason_map": {},
+        }
 
-        # 1) Decide outputs we actually want to return
-        self.logger.info("[DEBUG] Starting _resolve_materialize_set")
         original_materialize = materialize
-        outputs, auto_computed_outputs = self._resolve_outputs_for_run(config, materialize)
-        self.logger.info(f"[DEBUG] _resolve_materialize_set completed -> outputs={outputs}")
+        outputs: List[str] = []
+        required: Set[str] = set()
+        execution_plan: Dict[str, str] = {}
 
-        # 2) Decide what we must plan/compute (ancestor closure of outputs)
-        self.logger.info("[DEBUG] Computing required node set")
-        if not outputs:
-            if isinstance(original_materialize, (list, tuple, set)) and len(original_materialize) > 0:
-                self.logger.info("\n[OPTIMIZATION] No valid materialize targets resolved → no work")
+        try:
+            # 1) Decide outputs we actually want to return
+            self.logger.info("[DEBUG] Starting _resolve_materialize_set")
+            outputs, auto_computed_outputs = self._resolve_outputs_for_run(config, materialize)
+            self.logger.info(f"[DEBUG] _resolve_materialize_set completed -> outputs={outputs}")
+
+            # 2) Decide what we must plan/compute (ancestor closure of outputs)
+            self.logger.info("[DEBUG] Computing required node set")
+            if not outputs:
+                if isinstance(original_materialize, (list, tuple, set)) and len(original_materialize) > 0:
+                    self.logger.info("\n[OPTIMIZATION] No valid materialize targets resolved → no work")
+                    self._emit_pipeline_report(
+                        config=config,
+                        original_materialize=original_materialize,
+                        outputs=[],
+                        required=set(),
+                        execution_plan={},
+                        run_status="completed",
+                        error_message=None,
+                        elapsed_s=time.time() - run_started,
+                    )
+                    return {}
+                self.logger.info("\n[OPTIMIZATION] No outputs requested and all default outputs are cached → no work")
+                self._emit_pipeline_report(
+                    config=config,
+                    original_materialize=original_materialize,
+                    outputs=[],
+                    required=set(),
+                    execution_plan={},
+                    run_status="completed",
+                    error_message=None,
+                    elapsed_s=time.time() - run_started,
+                )
                 return {}
-            self.logger.info("\n[OPTIMIZATION] No outputs requested and all default outputs are cached → no work")
-            return {}
-        required = self._required_nodes(outputs)
-        self.logger.info(f"[DEBUG] Required nodes resolved: {sorted(required)}")
+            required = self._required_nodes(outputs)
+            self.logger.info(f"[DEBUG] Required nodes resolved: {sorted(required)}")
 
-        # 3) Build plan on the required subgraph
-        self.logger.info("[DEBUG] Starting determine_execution_plan")
-        execution_plan = self.determine_execution_plan(config, required)
-        self.logger.info("[DEBUG] determine_execution_plan completed")
+            # 3) Build plan on the required subgraph
+            self.logger.info("[DEBUG] Starting determine_execution_plan")
+            execution_plan = self.determine_execution_plan(config, required)
+            self.logger.info("[DEBUG] determine_execution_plan completed")
+            self._run_context["reason_map"] = {
+                node_name: self.get_execution_reason(node_name, config, execution_plan)
+                for node_name in required
+            }
 
-        self._log_execution_plan(config, execution_plan)
+            self._log_execution_plan(config, execution_plan)
 
-        # 4) Execution order in required subgraph
-        execution_order = [n for n in self._get_execution_order() if n in required]
-        all_cached = all(execution_plan[n] == "CACHED" for n in execution_order)
+            # 4) Execution order in required subgraph
+            execution_order = [n for n in self._get_execution_order() if n in required]
+            all_cached = all(execution_plan[n] == "CACHED" for n in execution_order)
 
-        # 5) Fast path when everything is cached:
-        #    load ONLY the requested outputs (not every ancestor)
-        if all_cached:
-            self.logger.info(f"\n[OPTIMIZATION] All {len(execution_order)} required nodes cached; materializing outputs only")
-            results = {}
+            # 5) Fast path when everything is cached:
+            #    load ONLY the requested outputs (not every ancestor)
+            if all_cached:
+                self.logger.info(f"\n[OPTIMIZATION] All {len(execution_order)} required nodes cached; materializing outputs only")
+                results = {}
+                cached_timings: Dict[str, Dict[str, Any]] = {}
+                for n in outputs:
+                    node_start = time.time()
+                    results[n] = self._load_node_from_cache(config, n)
+                    self.logger.info(f"    {n}: [LOADED FROM CACHE]")
+                    cached_timings[n] = {
+                        "status": "cached",
+                        "elapsed_s": time.time() - node_start,
+                        "reason": self._run_context.get("reason_map", {}).get(n),
+                    }
+                self._last_node_timings = cached_timings
+                self._log_elapsed_summary(cached_timings)
+                self._emit_pipeline_report(
+                    config=config,
+                    original_materialize=original_materialize,
+                    outputs=outputs,
+                    required=required,
+                    execution_plan=execution_plan,
+                    run_status="completed",
+                    error_message=None,
+                    elapsed_s=time.time() - run_started,
+                )
+                return results
+
+            # 6) Dirty path: compute dirty, load only nearest cached parents (frontier)
+            start_time = time.time()
+            results = self._run_dirty_path(config, execution_plan, execution_order, required)
+
+            # 7) Ensure requested outputs are returned (load if not produced above)
             for n in outputs:
-                results[n] = self._load_node_from_cache(config, n)
-                self.logger.info(f"    {n}: [LOADED FROM CACHE]")
-            return results
+                if n not in results:
+                    node_start = time.time()
+                    results[n] = self._load_node_from_cache(config, n)
+                    self.logger.info(f"    {n}: [LOADED FROM CACHE] (output)")
+                    self._last_node_timings[n] = {
+                        "status": "cached",
+                        "elapsed_s": time.time() - node_start,
+                        "reason": self._run_context.get("reason_map", {}).get(n),
+                    }
 
-        # 6) Dirty path: compute dirty, load only nearest cached parents (frontier)
-        start_time = time.time()
-        results = self._run_dirty_path(config, execution_plan, execution_order, required)
+            # 8) If we auto-computed nodes due to config changes but materialize was "none",
+            # don't return their results (they were computed but not requested)
+            if auto_computed_outputs and original_materialize == "none":
+                self.logger.info(f"[DEBUG] Filtering out auto-computed nodes from results (materialize='none'): {auto_computed_outputs}")
+                self._emit_pipeline_report(
+                    config=config,
+                    original_materialize=original_materialize,
+                    outputs=[],
+                    required=required,
+                    execution_plan=execution_plan,
+                    run_status="completed",
+                    error_message=None,
+                    elapsed_s=time.time() - run_started,
+                )
+                return {}
 
-        # 7) Ensure requested outputs are returned (load if not produced above)
-        for n in outputs:
-            if n not in results:
-                results[n] = self._load_node_from_cache(config, n)
-                self.logger.info(f"    {n}: [LOADED FROM CACHE] (output)")
-
-        # 8) If we auto-computed nodes due to config changes but materialize was "none",
-        # don't return their results (they were computed but not requested)
-        if auto_computed_outputs and original_materialize == "none":
-            self.logger.info(f"[DEBUG] Filtering out auto-computed nodes from results (materialize='none'): {auto_computed_outputs}")
-            # Only return results for nodes that were actually requested (none in this case)
-            return {}
-
-        self.logger.info(f"\nEXECUTION COMPLETED in {time.time() - start_time:.2f} seconds")
-        # Return only requested outputs for consistent cold/warm materialization behavior.
-        return {n: results[n] for n in outputs if n in results}
+            self.logger.info(f"\nEXECUTION COMPLETED in {time.time() - start_time:.2f} seconds")
+            self._log_elapsed_summary(self._last_node_timings)
+            final_results = {n: results[n] for n in outputs if n in results}
+            self._emit_pipeline_report(
+                config=config,
+                original_materialize=original_materialize,
+                outputs=outputs,
+                required=required,
+                execution_plan=execution_plan,
+                run_status="completed",
+                error_message=None,
+                elapsed_s=time.time() - run_started,
+            )
+            return final_results
+        except Exception as err:
+            self._emit_pipeline_report(
+                config=config,
+                original_materialize=original_materialize,
+                outputs=outputs,
+                required=required if required else set(self._last_node_timings.keys()),
+                execution_plan=execution_plan,
+                run_status="failed",
+                error_message=f"{type(err).__name__}: {err}",
+                elapsed_s=time.time() - run_started,
+            )
+            raise
     
     def _get_execution_order(self) -> List[str]:
         """

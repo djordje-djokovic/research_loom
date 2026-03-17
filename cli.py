@@ -5,6 +5,8 @@ Provides reusable argument parsing and command handling for all studies.
 
 import argparse
 import sys
+import webbrowser
+from pathlib import Path
 from typing import Dict, Any, List, Optional, Callable
 
 from research_loom.pipeline.core import ResearchPipeline, create_study_structure
@@ -143,6 +145,30 @@ Examples:
              "Example: --view viz_semantic_similarity"
              "Example: --view raw_data cox_model"
     )
+    parser.add_argument(
+        "--pipeline-report",
+        choices=["on", "off"],
+        help="Override logging.pipeline_report.enabled for this run."
+    )
+    parser.add_argument(
+        "--pipeline-report-format",
+        choices=["json", "html", "both"],
+        help="Override logging.pipeline_report.format for this run."
+    )
+    parser.add_argument(
+        "--pipeline-report-dir",
+        help="Override logging.pipeline_report.output_dir for this run."
+    )
+    parser.add_argument(
+        "--pipeline-report-keep-last",
+        type=int,
+        help="Override logging.pipeline_report.keep_last_n for this run."
+    )
+    parser.add_argument(
+        "--open-pipeline-report",
+        action="store_true",
+        help="Open latest pipeline DAG HTML report in browser after run."
+    )
     
     return parser
 
@@ -254,7 +280,27 @@ def normalize_materialize(materialize: Any) -> Any:
     """
     if not materialize or materialize == ["results"]:
         return "none"
+    if isinstance(materialize, (list, tuple)) and len(materialize) == 1:
+        token = str(materialize[0]).strip().lower()
+        if token in {"all", "none", "sinks"}:
+            return token
     return materialize
+
+
+def apply_pipeline_report_overrides(config: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
+    """Apply CLI overrides to strict logging.pipeline_report config."""
+    logging_cfg = config.setdefault("logging", {})
+    report_cfg = logging_cfg.setdefault("pipeline_report", {})
+
+    if args.pipeline_report is not None:
+        report_cfg["enabled"] = args.pipeline_report == "on"
+    if args.pipeline_report_format is not None:
+        report_cfg["format"] = args.pipeline_report_format
+    if args.pipeline_report_dir is not None:
+        report_cfg["output_dir"] = args.pipeline_report_dir
+    if args.pipeline_report_keep_last is not None:
+        report_cfg["keep_last_n"] = args.pipeline_report_keep_last
+    return config
 
 
 def run_cli(
@@ -293,6 +339,7 @@ def run_cli(
     
     # Load configuration (needed for invalidation and running pipeline)
     config = load_config(args.config)
+    config = apply_pipeline_report_overrides(config, args)
     
     # Track which nodes were invalidated so we can ensure they're computed
     invalidated_nodes = set()
@@ -338,8 +385,10 @@ def run_cli(
             materialize = materialize_list
             print(f"Auto-materializing invalidated nodes: {sorted(invalidated_nodes)}")
     
-    # Run the study
-    results, pipeline, config = run_study(args.config, materialize)
+    # Run with the already-loaded (and CLI-overridden) config so strict
+    # pipeline_report settings apply deterministically.
+    pipeline = create_pipeline()
+    results = pipeline.run_pipeline(config, materialize=materialize)
     
     print(f"\nStudy completed!")
     print(f"Results: {list(results.keys())}")
@@ -349,6 +398,16 @@ def run_cli(
         results_data = results["results"]
         print(f"\nModel Summary:")
         print(results_data)
+
+    if args.open_pipeline_report:
+        report_paths = getattr(pipeline, "_last_report_paths", {}) or {}
+        html_path = report_paths.get("latest_html") or report_paths.get("html")
+        if html_path:
+            file_url = Path(html_path).resolve().as_uri()
+            webbrowser.open(file_url)
+            print(f"Opened pipeline report: {html_path}")
+        else:
+            print("No HTML pipeline report available to open (check pipeline_report.format).")
 
 
 def main():

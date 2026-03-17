@@ -161,6 +161,23 @@ model:
     max_iter: 1000
 ```
 
+### Required Pipeline Reporting Contract
+
+`ResearchPipeline.run_pipeline()` now requires a strict reporting block in config:
+
+```yaml
+logging:
+  pipeline_report:
+    enabled: true
+    format: "both"            # json | html | both
+    output_dir: "run_reports"
+    keep_last_n: 20
+    include_edge_payloads: true
+    write_latest_pointer: true
+```
+
+Projects consuming `research_loom` (for example `secondary_sale`) must add this block before upgrading to this version.
+
 ## Cache Management
 
 - **Cache location**: `studies/<study>/cache/` (per study)
