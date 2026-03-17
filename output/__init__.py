@@ -15,6 +15,10 @@ from .html_tables import (
     regression_table,
     combined_regression_table,
 )
+from .html_theme import (
+    build_html_document,
+    get_shared_html_css,
+)
 
 __all__ = [
     "simpletable",
@@ -23,4 +27,6 @@ __all__ = [
     "sample_composition_table",
     "regression_table",
     "combined_regression_table",
+    "build_html_document",
+    "get_shared_html_css",
 ]

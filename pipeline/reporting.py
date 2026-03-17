@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
+from research_loom.output.html_theme import build_html_document, get_shared_html_css
 
 
 REQUIRED_REPORT_KEYS = {
@@ -269,36 +270,74 @@ def _write_preview_html(
     if not table_rows:
         table_rows.append("<tr><td><i>No preview rows available</i></td></tr>")
 
-    html = f"""<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Artifact Preview - {_escape(node_name)}::{_escape(str(artifact.get("key")))}</title>
-  <style>
-    body {{ font-family: Segoe UI, Arial, sans-serif; margin: 18px; background: #0f172a; color: #e2e8f0; }}
-    .meta {{ margin-bottom: 12px; font-size: 13px; color: #cbd5e1; }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
-    th, td {{ border: 1px solid #334155; padding: 6px 8px; text-align: left; vertical-align: top; }}
-    th {{ background: #1e293b; color: #93c5fd; }}
-    tr:nth-child(even) td {{ background: #111827; }}
-  </style>
-</head>
-<body>
+    body_html = f"""
   <h2>Preview: {_escape(node_name)} :: {_escape(str(artifact.get("key")))}</h2>
-  <div class="meta">
+  <div class="meta rl-card">
     <b>Format:</b> {_escape(artifact.get("format"))} |
     <b>Rows shown:</b> {len(rows)} |
     <b>Total rows:</b> {row_count} |
     <b>Source:</b> {_escape(artifact.get("abs_path"))}
   </div>
-  <table>
+  <table class="simpletable">
     <thead><tr>{table_head}</tr></thead>
     <tbody>{''.join(table_rows)}</tbody>
   </table>
-</body>
-</html>
 """
+    html = build_html_document(
+        title=f"Artifact Preview - {node_name}::{artifact.get('key')}",
+        body_html=body_html,
+        extra_css=".meta { margin-bottom: 12px; font-size: 13px; }",
+    )
     preview_path.write_text(html, encoding="utf-8")
+
+
+def build_node_inspector_html(envelope: Dict[str, Any], node_name: str, title: Optional[str] = None) -> str:
+    outputs = envelope.get("outputs") if isinstance(envelope, dict) else {}
+    output_rows: List[str] = []
+    for key, payload in (outputs or {}).items():
+        if not isinstance(payload, dict):
+            continue
+        val = payload.get("value")
+        rendered = ""
+        if isinstance(val, dict) and val.get("__artifact__"):
+            rendered = f"artifact: {_escape(val.get('path'))} ({_escape(val.get('format'))})"
+        elif isinstance(val, (dict, list)):
+            rendered = _escape(pyjson.dumps(val, ensure_ascii=False)[:1000])
+        else:
+            rendered = _escape(str(val))
+        output_rows.append(
+            "<tr>"
+            f"<td><b>{_escape(key)}</b></td>"
+            f"<td>{_escape(payload.get('type'))}</td>"
+            f"<td>{_escape(payload.get('storage', ''))}</td>"
+            f"<td>{_escape(payload.get('preview', ''))}</td>"
+            f"<td><code>{rendered}</code></td>"
+            "</tr>"
+        )
+    if not output_rows:
+        output_rows.append("<tr><td colspan='5'><i>No outputs</i></td></tr>")
+
+    summary_json = _escape(pyjson.dumps(envelope.get("summary", {}), ensure_ascii=False, indent=2))
+    metadata_json = _escape(pyjson.dumps(envelope.get("metadata", {}), ensure_ascii=False, indent=2))
+    page_title = title or f"Node Inspector - {node_name}"
+    body_html = f"""
+  <h2>{_escape(page_title)}</h2>
+  <div class="meta rl-card"><b>Node:</b> {_escape(node_name)} | <b>Status:</b> {_escape(envelope.get("status"))}</div>
+  <h3>Summary</h3>
+  <pre>{summary_json}</pre>
+  <h3>Outputs</h3>
+  <table class="simpletable">
+    <thead><tr><th>Key</th><th>Type</th><th>Storage</th><th>Preview</th><th>Value</th></tr></thead>
+    <tbody>{''.join(output_rows)}</tbody>
+  </table>
+  <h3>Metadata</h3>
+  <pre>{metadata_json}</pre>
+"""
+    return build_html_document(
+        title=page_title,
+        body_html=body_html,
+        extra_css=".meta { margin-bottom: 12px; font-size: 13px; } table { margin-top: 10px; }",
+    )
 
 
 def _select_primary_artifact(artifact_links: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -334,6 +373,22 @@ def _build_enriched_manifest(manifest: Dict[str, Any], output_dir: Path, include
 
     for node in data.get("nodes", []):
         artifact_links: List[Dict[str, Any]] = []
+        inspector_href = None
+        cache_file_path = str(node.get("cache_file_path") or "").strip()
+        if include_previews and cache_file_path:
+            cache_path = Path(cache_file_path)
+            if cache_path.exists():
+                try:
+                    cache_blob = pyjson.loads(cache_path.read_text(encoding="utf-8"))
+                    envelope = cache_blob.get("_result") if isinstance(cache_blob, dict) else None
+                    if isinstance(envelope, dict) and "outputs" in envelope and "status" in envelope:
+                        inspector_name = f"{run_id}_{_slugify(str(node.get('name')))}_inspector.html"
+                        inspector_path = previews_dir / inspector_name
+                        inspector_html = build_node_inspector_html(envelope, str(node.get("name")))
+                        inspector_path.write_text(inspector_html, encoding="utf-8")
+                        inspector_href = inspector_path.resolve().as_uri()
+                except Exception:
+                    inspector_href = None
         for idx, artifact in enumerate(node.get("output_artifacts", []) or []):
             abs_path = str(artifact.get("abs_path") or "").strip()
             fmt = str(artifact.get("format") or "")
@@ -369,6 +424,9 @@ def _build_enriched_manifest(manifest: Dict[str, Any], output_dir: Path, include
             node["primary_artifact_href"] = None
             node["primary_preview_href"] = None
             node["primary_artifact_key"] = None
+        node["inspector_href"] = inspector_href
+        if inspector_href and not node.get("primary_preview_href"):
+            node["primary_preview_href"] = inspector_href
     return data
 
 
@@ -402,13 +460,14 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
     materialize = manifest.get("materialize")
     materialize_text = materialize if isinstance(materialize, str) else ", ".join(materialize or [])
     outputs = manifest.get("outputs", [])
+    shared_css = get_shared_html_css()
     html = f"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
   <title>Pipeline DAG Report { _escape(manifest.get("run_id")) }</title>
   <style>
-    body {{ background: #111827; color: #e5e7eb; font-family: Segoe UI, Arial, sans-serif; margin: 18px; }}
+    {shared_css}
     h1,h2 {{ margin: 0 0 8px 0; }}
     h1 {{
       font-size: 18px;
@@ -437,14 +496,17 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
       word-break: break-word;
     }}
     .runbar b {{ color: #93c5fd; }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
-    th, td {{ padding: 8px; border-bottom: 1px solid #374151; text-align: left; vertical-align: top; }}
-    th {{ cursor: pointer; color: #93c5fd; }}
+    #nodeTable th {{ cursor: pointer; }}
     .dag-tooltip {{
       position: fixed;
-      z-index: 9999;
+      z-index: 9600;
       display: none;
-      max-width: 520px;
+      top: 92px;
+      left: 20px;
+      width: min(560px, calc(100vw - 40px));
+      max-height: 42vh;
+      overflow-y: auto;
+      overflow-x: hidden;
       background: rgba(15, 23, 42, 0.97);
       border: 1px solid #60a5fa;
       border-radius: 10px;
@@ -453,25 +515,53 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
       line-height: 1.35;
       color: #e2e8f0;
       pointer-events: none;
-      box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+      box-shadow: 0 10px 28px rgba(0, 0, 0, 0.42);
       white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;
     }}
     .dag-tooltip .row {{ margin: 0 0 2px 0; }}
     .dag-tooltip .k {{ color: #93c5fd; font-weight: 700; }}
+    .drawer-backdrop {{
+      position: fixed;
+      inset: 0;
+      background: rgba(2, 6, 23, 0.35);
+      opacity: 0;
+      visibility: hidden;
+      pointer-events: none;
+      transition: opacity 140ms ease, visibility 140ms ease;
+      z-index: 8998;
+    }}
+    .drawer-backdrop.open {{
+      opacity: 1;
+      visibility: visible;
+      pointer-events: auto;
+    }}
     .artifact-panel {{
       position: fixed;
-      right: 18px;
-      top: 18px;
-      width: 420px;
-      max-height: calc(100vh - 36px);
+      right: 12px;
+      top: 12px;
+      width: min(460px, calc(100vw - 24px));
+      height: calc(100vh - 24px);
       overflow: auto;
       background: rgba(15, 23, 42, 0.98);
       border: 1px solid #334155;
-      border-radius: 10px;
+      border-radius: 14px;
       box-shadow: 0 8px 30px rgba(0, 0, 0, 0.45);
       padding: 10px 12px;
-      z-index: 9000;
-      display: none;
+      z-index: 9001;
+      transform: translateX(calc(100% + 20px));
+      opacity: 0;
+      visibility: hidden;
+      pointer-events: none;
+      will-change: transform, opacity;
+      transition: transform 150ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity 120ms ease, visibility 120ms ease;
+    }}
+    .artifact-panel.open {{
+      transform: translateX(0);
+      opacity: 1;
+      visibility: visible;
+      pointer-events: auto;
     }}
     .artifact-panel h3 {{ margin: 2px 0 8px 0; font-size: 15px; color: #93c5fd; }}
     .artifact-panel .meta {{ font-size: 12px; margin-bottom: 10px; color: #cbd5e1; }}
@@ -522,7 +612,7 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
   </div>
   <div class="card">
     <h2>Node Metrics</h2>
-    <table id="nodeTable">
+    <table id="nodeTable" class="simpletable">
       <thead>
         <tr>
           <th onclick="sortTable(0)">Node</th>
@@ -541,6 +631,7 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
     </table>
   </div>
   <div id="dagTooltip" class="dag-tooltip"></div>
+  <div id="drawerBackdrop" class="drawer-backdrop"></div>
   <div id="artifactPanel" class="artifact-panel">
     <button id="artifactPanelClose" class="artifact-close">Close</button>
     <div id="artifactPanelBody"></div>
@@ -613,6 +704,7 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
     function renderArtifactPanel(node) {{
       const panel = document.getElementById('artifactPanel');
       const body = document.getElementById('artifactPanelBody');
+      const backdrop = document.getElementById('drawerBackdrop');
       if (!panel || !body || !node) return;
       const links = Array.isArray(node.artifact_links) ? node.artifact_links : [];
       let html = `
@@ -623,6 +715,9 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
           Outputs: <b>${{links.length}}</b>
         </div>
       `;
+      if (node.inspector_href) {{
+        html += `<div class="artifact-actions" style="margin-bottom:8px;"><a href="${{escapeHtml(node.inspector_href)}}" target="_blank" rel="noopener noreferrer">Open Inspector</a></div>`;
+      }}
       if (!links.length) {{
         html += `<div class="artifact-item">No output artifacts available for this node.</div>`;
       }} else {{
@@ -646,12 +741,15 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
         html += '</div>';
       }}
       body.innerHTML = html;
-      panel.style.display = 'block';
+      panel.classList.add('open');
+      if (backdrop) backdrop.classList.add('open');
     }}
 
     function closeArtifactPanel() {{
       const panel = document.getElementById('artifactPanel');
-      if (panel) panel.style.display = 'none';
+      const backdrop = document.getElementById('drawerBackdrop');
+      if (panel) panel.classList.remove('open');
+      if (backdrop) backdrop.classList.remove('open');
     }}
 
     function arrowPoints(x2, y2, c2x, c2y, size = 11.5) {{
@@ -735,6 +833,8 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
       const nodeByName = new Map(nodes.map((n) => [n.name, n]));
       const closeBtn = document.getElementById('artifactPanelClose');
       if (closeBtn) closeBtn.onclick = closeArtifactPanel;
+      const backdrop = document.getElementById('drawerBackdrop');
+      if (backdrop) backdrop.onclick = closeArtifactPanel;
 
       const g = document.createElementNS(NS, 'g');
       g.setAttribute('transform', `translate(${{pad}}, ${{pad}})`);
@@ -872,17 +972,11 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
         }}).join('');
         tooltip.innerHTML = html;
       }};
-      const move = (ev) => {{
-        tooltip.style.left = `${{ev.clientX + 14}}px`;
-        tooltip.style.top = `${{ev.clientY + 14}}px`;
-      }};
       hoverEls.forEach((el) => {{
-        el.addEventListener('mouseenter', (ev) => {{
+        el.addEventListener('mouseenter', () => {{
           renderTooltip(el.getAttribute('data-tooltip'));
           tooltip.style.display = 'block';
-          move(ev);
         }});
-        el.addEventListener('mousemove', move);
         el.addEventListener('mouseleave', () => {{ tooltip.style.display = 'none'; }});
       }});
 
@@ -987,6 +1081,9 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
         drag = null;
       }});
       svg.addEventListener('click', () => closeArtifactPanel());
+      window.addEventListener('keydown', (ev) => {{
+        if (ev.key === 'Escape') closeArtifactPanel();
+      }});
     }}
 
     function sortTable(col, numeric) {{

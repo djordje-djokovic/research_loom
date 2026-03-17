@@ -182,9 +182,32 @@ logging:
 
 Projects consuming `research_loom` (for example `secondary_sale`) must add this block before upgrading to this version.
 
+### Required Typed Node Output Contract
+
+Every node function must return a strict typed envelope (legacy flat dict returns are rejected):
+
+```yaml
+status: completed            # completed | failed | skipped
+summary: {}                  # small human-oriented metadata
+outputs:
+  some_key:
+    type: json               # dataframe | html | json | jsonl | figure | image | zip | binary | text
+    value: <python-object>
+    storage: json.zst        # optional, defaults by type
+    preview: json            # optional, hint for inspector/report
+artifacts: {}                # optional
+metadata: {}                 # optional machine metadata
+```
+
+Behavior:
+- Cache persistence is now driven by `outputs.<key>.type` + optional `storage`.
+- Downstream node inputs remain plain Python values (`inputs["upstream"]["key"]`), with metadata available in `inputs["upstream"]["_meta"]`.
+- `--view <node>` and DAG report previews both use the same canonical node inspector HTML rendering.
+
 Pipeline DAG HTML interactions:
 - Single-click a node to open its output artifact panel.
-- Double-click a node to open its primary artifact directly.
+- Single-click panel includes an `Open Inspector` action for the canonical typed envelope view.
+- Double-click a node to open its primary artifact or inspector directly.
 - For tabular outputs (`parquet`, `json.zst`, `jsonl.zst`, `csv`, `json`), the report writes preview HTML files and exposes `Preview` links.
 
 ## Cache Management

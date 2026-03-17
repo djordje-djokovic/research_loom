@@ -21,6 +21,7 @@ framework_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(framework_root))
 
 from research_loom.pipeline.core import ResearchPipeline, Node
+from research_loom.modeling.result_builders import build_node_output, output_item
 import yaml
 import time
 import hashlib
@@ -56,13 +57,19 @@ def load_raw_data(inputs, config):
     print(f"Loading raw data from {source}...")
     time.sleep(0.1)  # Simulate data loading
     
-    return {
-        "data": f"Raw data from {source}",
-        "sample_size": sample_size,
-        "source": source,
-        "timestamp": time.time(),
-        "config_hash": hashlib.md5(json.dumps(config, sort_keys=True).encode()).hexdigest()[:8]
-    }
+    return build_node_output(
+        status="completed",
+        summary={"source": source, "sample_size": sample_size},
+        outputs={
+            "data": output_item("text", f"Raw data from {source}", storage="txt"),
+            "sample_size": output_item("json", sample_size, storage="json"),
+            "source": output_item("text", source, storage="txt"),
+        },
+        metadata={
+            "timestamp": time.time(),
+            "config_hash": hashlib.md5(json.dumps(config, sort_keys=True).encode()).hexdigest()[:8],
+        },
+    )
 
 
 def process_dataframe(inputs, config):
@@ -74,7 +81,11 @@ def process_dataframe(inputs, config):
     sample_size = raw_data.get("sample_size", 100)
     
     if not HAS_PANDAS:
-        return {"error": "pandas not available"}
+        return build_node_output(
+            status="failed",
+            summary={"error": "pandas not available"},
+            outputs={"error": output_item("text", "pandas not available", storage="txt")},
+        )
     
     print(f"Processing DataFrame with {sample_size} rows...")
     
@@ -87,16 +98,23 @@ def process_dataframe(inputs, config):
         "score": np.random.uniform(0, 100, sample_size),
     })
     
-    return {
-        "processed_df": df,  # Will be stored as parquet
-        "summary": {
-            "rows": len(df),
-            "columns": list(df.columns),
-            "mean_score": float(df["score"].mean()),
+    return build_node_output(
+        status="completed",
+        summary={"rows": len(df)},
+        outputs={
+            "processed_df": output_item("dataframe", df, storage="parquet", preview="table"),
+            "summary": output_item(
+                "json",
+                {"rows": len(df), "columns": list(df.columns), "mean_score": float(df["score"].mean())},
+                storage="json.zst",
+                preview="json",
+            ),
         },
-        "timestamp": time.time(),
-        "config_hash": hashlib.md5(json.dumps(config, sort_keys=True).encode()).hexdigest()[:8]
-    }
+        metadata={
+            "timestamp": time.time(),
+            "config_hash": hashlib.md5(json.dumps(config, sort_keys=True).encode()).hexdigest()[:8],
+        },
+    )
 
 
 def create_visualization(inputs, config):
@@ -107,14 +125,26 @@ def create_visualization(inputs, config):
     processed = inputs.get("processed_dataframe", {})
     
     if not HAS_PLOTLY:
-        return {"error": "plotly not available"}
+        return build_node_output(
+            status="failed",
+            summary={"error": "plotly not available"},
+            outputs={"error": output_item("text", "plotly not available", storage="txt")},
+        )
     
     if not HAS_PANDAS:
-        return {"error": "pandas not available"}
+        return build_node_output(
+            status="failed",
+            summary={"error": "pandas not available"},
+            outputs={"error": output_item("text", "pandas not available", storage="txt")},
+        )
     
     df = processed.get("processed_df")
     if df is None or not isinstance(df, pd.DataFrame):
-        return {"error": "No DataFrame available"}
+        return build_node_output(
+            status="failed",
+            summary={"error": "No DataFrame available"},
+            outputs={"error": output_item("text", "No DataFrame available", storage="txt")},
+        )
     
     print("Creating visualization...")
     
@@ -140,11 +170,15 @@ def create_visualization(inputs, config):
         height=600,
     )
     
-    return {
-        "figure": fig,  # Will be stored as HTML
-        "timestamp": time.time(),
-        "config_hash": hashlib.md5(json.dumps(config, sort_keys=True).encode()).hexdigest()[:8]
-    }
+    return build_node_output(
+        status="completed",
+        summary={"status": "ok"},
+        outputs={"figure": output_item("figure", fig, storage="html", preview="figure")},
+        metadata={
+            "timestamp": time.time(),
+            "config_hash": hashlib.md5(json.dumps(config, sort_keys=True).encode()).hexdigest()[:8],
+        },
+    )
 
 
 def calculate_statistics(inputs, config):
@@ -156,10 +190,12 @@ def calculate_statistics(inputs, config):
     df = processed.get("processed_df")
     
     if df is None or not HAS_PANDAS:
-        return {
-            "error": "No DataFrame available",
-            "timestamp": time.time(),
-        }
+        return build_node_output(
+            status="failed",
+            summary={"error": "No DataFrame available"},
+            outputs={"error": output_item("text", "No DataFrame available", storage="txt")},
+            metadata={"timestamp": time.time()},
+        )
     
     print("Calculating statistics...")
     
@@ -181,11 +217,15 @@ def calculate_statistics(inputs, config):
             "mean_value": float(cat_data["value"].mean()),
         }
     
-    return {
-        "statistics": stats,
-        "timestamp": time.time(),
-        "config_hash": hashlib.md5(json.dumps(config, sort_keys=True).encode()).hexdigest()[:8]
-    }
+    return build_node_output(
+        status="completed",
+        summary={"status": "ok"},
+        outputs={"statistics": output_item("json", stats, storage="json.zst", preview="json")},
+        metadata={
+            "timestamp": time.time(),
+            "config_hash": hashlib.md5(json.dumps(config, sort_keys=True).encode()).hexdigest()[:8],
+        },
+    )
 
 
 def generate_report(inputs, config):
@@ -216,11 +256,15 @@ def generate_report(inputs, config):
         "timestamp": time.time(),
     }
     
-    return {
-        "report": report,
-        "timestamp": time.time(),
-        "config_hash": hashlib.md5(json.dumps(config, sort_keys=True).encode()).hexdigest()[:8]
-    }
+    return build_node_output(
+        status="completed",
+        summary={"status": "ok"},
+        outputs={"report": output_item("json", report, storage="json.zst", preview="json")},
+        metadata={
+            "timestamp": time.time(),
+            "config_hash": hashlib.md5(json.dumps(config, sort_keys=True).encode()).hexdigest()[:8],
+        },
+    )
 
 
 # ============================================================================

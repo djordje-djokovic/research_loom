@@ -23,9 +23,11 @@ import yaml
 from research_loom.pipeline.reporting import (
     create_run_id,
     utc_now_iso,
+    build_node_inspector_html,
     validate_report_config,
     write_report_bundle,
 )
+from research_loom.output.html_theme import get_shared_html_css
 
 # Optional imports for artifact handling
 try:
@@ -75,6 +77,18 @@ def _blake12(s: str) -> str:
     return hashlib.blake2b(s.encode(), digest_size=12).hexdigest()
 
 class ResearchPipeline:
+    ALLOWED_OUTPUT_TYPES = {
+        "dataframe",
+        "html",
+        "json",
+        "jsonl",
+        "figure",
+        "image",
+        "zip",
+        "binary",
+        "text",
+    }
+
     def __init__(self, cache_dir: str = "cache", logger: Optional[logging.Logger] = None, 
                  redact_config: Optional[Callable[[str, Dict], Dict]] = None):
         self.cache_dir = Path(cache_dir)
@@ -196,6 +210,123 @@ class ResearchPipeline:
             "cache_file_path": str(cache_path.resolve()),
             "cache_file_bytes": cache_path.stat().st_size if cache_path.exists() else None,
         }
+
+    def _is_typed_envelope(self, payload: Any) -> bool:
+        return isinstance(payload, dict) and "status" in payload and "summary" in payload and "outputs" in payload
+
+    def _validate_typed_output_envelope(self, node_name: str, payload: Any) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise ValueError(f"Node '{node_name}' must return typed output envelope object")
+        required = {"status", "summary", "outputs"}
+        missing = sorted(required - set(payload.keys()))
+        if missing:
+            raise ValueError(f"Node '{node_name}' output missing required envelope keys: {missing}")
+        status = payload.get("status")
+        if status not in {"completed", "failed", "skipped"}:
+            raise ValueError(
+                f"Node '{node_name}' output.status must be one of completed|failed|skipped, got: {status!r}"
+            )
+        if not isinstance(payload.get("summary"), dict):
+            raise ValueError(f"Node '{node_name}' output.summary must be an object")
+        outputs = payload.get("outputs")
+        if not isinstance(outputs, dict):
+            raise ValueError(f"Node '{node_name}' output.outputs must be an object")
+        for key, output in outputs.items():
+            if not isinstance(output, dict):
+                raise ValueError(f"Node '{node_name}' output '{key}' must be an object with type/value")
+            if "type" not in output or "value" not in output:
+                raise ValueError(f"Node '{node_name}' output '{key}' must include 'type' and 'value'")
+            output_type = str(output.get("type"))
+            if output_type not in self.ALLOWED_OUTPUT_TYPES:
+                raise ValueError(
+                    f"Node '{node_name}' output '{key}' has unsupported type '{output_type}'. "
+                    f"Allowed: {sorted(self.ALLOWED_OUTPUT_TYPES)}"
+                )
+            storage = output.get("storage")
+            if storage is not None and not isinstance(storage, str):
+                raise ValueError(f"Node '{node_name}' output '{key}'.storage must be string when provided")
+            preview = output.get("preview")
+            if preview is not None and not isinstance(preview, str):
+                raise ValueError(f"Node '{node_name}' output '{key}'.preview must be string when provided")
+        if "metadata" in payload and not isinstance(payload.get("metadata"), dict):
+            raise ValueError(f"Node '{node_name}' output.metadata must be an object when provided")
+        if "artifacts" in payload and not isinstance(payload.get("artifacts"), dict):
+            raise ValueError(f"Node '{node_name}' output.artifacts must be an object when provided")
+        return payload
+
+    def _default_storage_for_output_type(self, output_type: str, value: Any) -> Optional[str]:
+        if output_type == "dataframe":
+            return "parquet"
+        if output_type == "html":
+            return "html"
+        if output_type == "json":
+            return "json.zst"
+        if output_type == "jsonl":
+            return "jsonl.zst"
+        if output_type == "figure":
+            if HAS_PLOTLY and isinstance(value, go.Figure):
+                return "html"
+            return "png"
+        if output_type == "image":
+            return "png"
+        if output_type == "zip":
+            return "zip"
+        if output_type == "binary":
+            return "bin"
+        if output_type == "text":
+            return "txt"
+        return None
+
+    def _persist_typed_outputs(self, node_name: str, cache_key: str, envelope: Dict[str, Any]) -> Dict[str, Any]:
+        node = self.nodes[node_name]
+        outputs = envelope.get("outputs", {})
+        persisted_outputs: Dict[str, Dict[str, Any]] = {}
+        artifacts_dir = self.get_artifacts_dir(node_name, cache_key)
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+        for key, output in outputs.items():
+            output_copy = dict(output)
+            value = output_copy.get("value")
+            declared_type = str(output_copy.get("type"))
+            storage = output_copy.get("storage")
+            if storage is None and node.storage_formats and key in node.storage_formats:
+                storage = node.storage_formats[key]
+            if storage is None:
+                storage = self._default_storage_for_output_type(declared_type, value)
+            if storage is not None:
+                output_copy["storage"] = storage
+                output_copy["value"] = self._spill_with_format(
+                    value,
+                    artifacts_dir,
+                    self._sanitize_key(key),
+                    key,
+                    storage,
+                )
+            persisted_outputs[key] = output_copy
+
+        out = dict(envelope)
+        out["outputs"] = persisted_outputs
+        return out
+
+    def _materialize_envelope_for_inputs(self, payload: Any) -> Any:
+        if not self._is_typed_envelope(payload):
+            return payload
+        outputs = payload.get("outputs", {})
+        materialized: Dict[str, Any] = {}
+        for key, output in outputs.items():
+            if not isinstance(output, dict):
+                continue
+            value = output.get("value")
+            if isinstance(value, dict) and value.get("__artifact__"):
+                materialized[key] = self._load_artifact(value)
+            else:
+                materialized[key] = value
+        materialized["_meta"] = {
+            "status": payload.get("status"),
+            "summary": payload.get("summary", {}),
+            "metadata": payload.get("metadata", {}),
+        }
+        return materialized
 
     def _record_node_io(self, node_name: str, cache_key: str, input_artifacts: List[Dict[str, Any]], output_payload: Any) -> None:
         output_artifacts = self._collect_output_artifacts(output_payload)
@@ -476,16 +607,16 @@ class ResearchPipeline:
 
     def _inject_dark_plotly_theme(self, html_content: str) -> str:
         """Inject dark background CSS/JS into Plotly HTML."""
-        css_code = """
+        css_code = f"""
 <style>
-    html, body {
-        background-color: #101010 !important;
-        margin: 0 !important;
-        padding: 0 !important;
-    }
-    body > div {
-        background-color: #101010 !important;
-    }
+{get_shared_html_css()}
+html, body {{
+    margin: 0 !important;
+    padding: 0 !important;
+}}
+body > div {{
+    background-color: #0f172a !important;
+}}
 </style>
 """
         if "</head>" in html_content:
@@ -495,9 +626,9 @@ class ResearchPipeline:
 
         js_code = """
 <script>
-    document.body.style.backgroundColor = "#101010";
+    document.body.style.backgroundColor = "#1e1e1e";
     if (document.body.parentElement) {
-        document.body.parentElement.style.backgroundColor = "#101010";
+        document.body.parentElement.style.backgroundColor = "#1e1e1e";
     }
 </script>
 """
@@ -670,8 +801,35 @@ class ResearchPipeline:
             elif format == "html":
                 if HAS_PLOTLY and isinstance(val, go.Figure):
                     self._write_plotly_html_with_dark_theme(val, path)
+                elif isinstance(val, str):
+                    path.write_text(val, encoding="utf-8")
                 else:
                     raise ValueError(f"Cannot convert {type(val)} to HTML")
+
+            elif format == "txt":
+                path.write_text("" if val is None else str(val), encoding="utf-8")
+
+            elif format == "zip":
+                if isinstance(val, (str, Path)):
+                    src = Path(val)
+                    if not src.exists() or src.suffix.lower() != ".zip":
+                        raise ValueError(f"ZIP storage expects existing .zip path, got: {val}")
+                    shutil.copy2(src, path)
+                elif isinstance(val, (bytes, bytearray)):
+                    path.write_bytes(bytes(val))
+                else:
+                    raise ValueError(f"Cannot convert {type(val)} to ZIP")
+
+            elif format in {"bin", "binary"}:
+                if isinstance(val, (bytes, bytearray)):
+                    path.write_bytes(bytes(val))
+                elif isinstance(val, (str, Path)):
+                    src = Path(val)
+                    if not src.exists():
+                        raise ValueError(f"Binary storage expects existing file path, got: {val}")
+                    shutil.copy2(src, path)
+                else:
+                    raise ValueError(f"Cannot convert {type(val)} to binary")
                     
             else:
                 raise ValueError(f"Unsupported storage format: {format}")
@@ -814,6 +972,10 @@ class ResearchPipeline:
                 with open(path, "rb") as f, dctx.stream_reader(f) as reader:
                     decompressed = reader.read()
                 return json.loads(decompressed.decode("utf-8"))
+
+            elif fmt == "json":
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
             
             elif fmt == "jsonl.zst":
                 if not HAS_ZSTD:
@@ -827,6 +989,12 @@ class ResearchPipeline:
             
             elif fmt in ("png", "html"):
                 return str(path)  # return path; caller can open/view
+
+            elif fmt == "txt":
+                return path.read_text(encoding="utf-8")
+
+            elif fmt in ("zip", "bin", "binary"):
+                return str(path)
             
             else:
                 raise ValueError(f"Unknown artifact format: {fmt}")
@@ -855,6 +1023,12 @@ class ResearchPipeline:
                 data = json.load(f)
             if not isinstance(data, dict):
                 return False
+            if "_result" not in data:
+                return False
+            try:
+                self._validate_typed_output_envelope(node_name, data["_result"])
+            except Exception:
+                return False
             return True
         except Exception:
             # Best-effort cleanup of corrupted cache
@@ -871,11 +1045,13 @@ class ResearchPipeline:
             raise FileNotFoundError(f"Cache file not found: {cache_path}")
         with open(cache_path, 'r') as f:
             data = json.load(f)
-            # Handle both old format (direct result) and new format (with metadata)
-            if isinstance(data, dict) and "_result" in data:
-                return data["_result"]  # Return as-is (may contain artifact pointers)
-            # Handle old format
-            return data
+            if not (isinstance(data, dict) and "_result" in data):
+                raise ValueError(
+                    f"Cache entry for node '{node_name}' is not in strict typed envelope cache format. "
+                    "Clear cache and rerun to regenerate."
+                )
+            result = data["_result"]
+            return self._validate_typed_output_envelope(node_name, result)
     
     def save_cache(
         self,
@@ -941,18 +1117,9 @@ class ResearchPipeline:
                 "effective_configs": {sec: self.redact_config(sec, (config or {}).get(sec, {})) for sec in sorted(self._section_closure(node_name))}
             }
             
-            # Process result for artifact spilling
-            processed_result = result
-            # Handle direct DataFrame/Arrow returns (must be before dict/list checks)
-            if self._is_dataframe_or_arrow(result):
-                processed_result = self._maybe_spill(node_name, cache_key, "result", result)
-            elif isinstance(result, dict):
-                processed_result = {}
-                for key, val in result.items():
-                    processed_result[key] = self._maybe_spill(node_name, cache_key, key, val)
-            elif isinstance(result, (list, tuple)) and len(result) > 0:
-                # For list/tuple results, check if we should spill the whole thing
-                processed_result = self._maybe_spill(node_name, cache_key, "result", result)
+            # Validate and persist typed envelope outputs (strict; no legacy adapters)
+            validated = self._validate_typed_output_envelope(node_name, result)
+            processed_result = self._persist_typed_outputs(node_name, cache_key, validated)
             
             # Wrap result with metadata
             cache_data = {
@@ -1234,11 +1401,14 @@ class ResearchPipeline:
                     input_artifacts: List[Dict[str, Any]] = []
                     for i in self.nodes[n].inputs:
                         val = results[i]
+                        for art in self._collect_output_artifacts(val):
+                            art["io_role"] = "input"
+                            art["input_name"] = i
+                            input_artifacts.append(art)
                         if isinstance(val, dict) and val.get("__artifact__"):
-                            input_artifacts.append(self._artifact_info(val, io_role="input", input_name=i))
                             ins[i] = self._load_artifact(val)
                         else:
-                            ins[i] = val
+                            ins[i] = self._materialize_envelope_for_inputs(val)
                     results[n] = self.execute_node(n, config, ins, input_artifacts=input_artifacts)
                     node_timings[n] = {
                         "status": "computed",
@@ -1702,6 +1872,20 @@ class ResearchPipeline:
         if formatter:
             formatter(node_name, result)
             return None
+
+        if self._is_typed_envelope(result):
+            node_cache_dir = Path(self.cache_dir) / node_name / cache_key
+            inspector_path = node_cache_dir / "node_inspector.html"
+            inspector_html = build_node_inspector_html(result, node_name=node_name, title=f"Node Inspector: {node_name}")
+            inspector_path.write_text(inspector_html, encoding="utf-8")
+            print(f"\n{'='*60}")
+            print(f"Node Inspector: {node_name}")
+            print(f"File: {inspector_path}")
+            print(f"{'='*60}")
+            if open_browser:
+                webbrowser.open(inspector_path.resolve().as_uri())
+                print("Opened in browser")
+            return inspector_path
         
         # Try to find and render DataFrames/JSON/Figures as HTML (generic for any model)
         # This creates a combined view if there are multiple artifact types
@@ -1884,110 +2068,10 @@ class ResearchPipeline:
     <meta charset="UTF-8">
     <title>Results: """ + node_name + (f" ({config_name})" if config_name else "") + """</title>
     <style>
-        body {
-            font-family: 'Consolas', 'Courier New', monospace;
-            background-color: #1e1e1e;
-            color: #d4d4d4;
-            margin: 0;
-            padding: 20px;
-            font-size: 12px;
-        }
-        h1 {
-            color: #ffffff;
-            border-bottom: 1px solid #ffffff;
-            padding-bottom: 10px;
-            font-size: 18px;
-            margin-bottom: 20px;
-        }
-        h2 {
-            color: #d4d4d4;
-            margin-top: 30px;
-            margin-bottom: 10px;
-            font-size: 14px;
-            border-bottom: 1px solid #3e3e42;
-            padding-bottom: 5px;
-        }
-        h3 {
-            color: #d4d4d4;
-            margin-top: 20px;
-            margin-bottom: 8px;
-            font-size: 13px;
-            border-bottom: 1px solid #3e3e42;
-            padding-bottom: 3px;
-        }
-        table {
-            border-collapse: collapse;
-            width: 100%;
-            margin-bottom: 20px;
-            background-color: #252526;
-            font-size: 11px;
-        }
-        th {
-            background-color: #2d2d30;
-            color: #cccccc;
-            font-weight: bold;
-            padding: 8px;
-            text-align: left;
-            border-bottom: 1px solid #3e3e42;
-            position: sticky;
-            top: 0;
-            z-index: 10;
-            font-size: 11px;
-        }
-        td {
-            padding: 6px 8px;
-            border-bottom: 1px solid #3e3e42;
-            font-size: 11px;
-        }
-        tr:hover {
-            background-color: #2a2d2e;
-        }
-        tr:nth-child(even) {
-            background-color: #1e1e1e;
-        }
-        tr:nth-child(even):hover {
-            background-color: #2a2d2e;
-        }
-        .info {
-            color: #858585;
-            font-size: 10px;
-            margin-bottom: 8px;
-        }
-        .stats-section {
-            background-color: #252526;
-            padding: 12px;
-            margin-bottom: 20px;
-            border-radius: 4px;
-        }
-        .stats-row {
-            display: table-row;
-        }
-        .stats-key {
-            display: table-cell;
-            padding: 4px 12px 4px 0;
-            color: #d4d4d4;
-            font-weight: bold;
-            min-width: 200px;
-        }
-        .stats-value {
-            display: table-cell;
-            padding: 4px 0;
-            color: #d4d4d4;
-        }
-        .model-summary-html {
-            background-color: #252526;
-            padding: 12px;
-            margin-bottom: 20px;
-            overflow-x: auto;
-        }
-        .model-summary-text {
-            background-color: #252526;
-            padding: 12px;
-            margin-bottom: 20px;
-            white-space: pre-wrap;
-            font-family: 'Consolas', 'Courier New', monospace;
-            font-size: 11px;
-        }
+        """ + get_shared_html_css() + """
+        h1, h2, h3 { margin-bottom: 8px; }
+        table, .simpletable { margin-bottom: 20px; font-size: 11px; }
+        th { position: sticky; top: 0; z-index: 10; }
     </style>
 </head>
 <body>
@@ -2044,16 +2128,13 @@ class ResearchPipeline:
             
             # Convert DataFrame to HTML table
             html_table = display_df.to_html(
-                classes=None,
+                classes="simpletable",
                 table_id=None,
                 escape=False,
                 index=False,  # Index is now a column, so don't show it again
                 float_format=lambda x: f'{x:.6f}' if isinstance(x, (int, float)) else str(x),
                 max_rows=None
             )
-            
-            # Add custom styling
-            html_table = html_table.replace('<table', '<table style="width:100%; border-collapse:collapse;"')
             html_parts.append('    ' + html_table)
             html_parts.append('')
         

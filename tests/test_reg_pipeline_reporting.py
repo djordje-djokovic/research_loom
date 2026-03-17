@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from research_loom.cli import apply_pipeline_report_overrides
+from research_loom.modeling.result_builders import build_node_output, output_item
 from research_loom.pipeline.core import Node, ResearchPipeline
 
 
@@ -13,11 +14,26 @@ pytestmark = pytest.mark.core
 
 def _build_pipeline(cache_dir: Path) -> ResearchPipeline:
     p = ResearchPipeline(cache_dir=str(cache_dir))
-    p.add_node(Node(name="source", func=lambda _ins, _cfg: {"items": [{"x": 1}, {"x": 2}]}, inputs=[], config_section="data"))
+    p.add_node(
+        Node(
+            name="source",
+            func=lambda _ins, _cfg: build_node_output(
+                status="completed",
+                summary={"n_items": 2},
+                outputs={"items": output_item("jsonl", [{"x": 1}, {"x": 2}], storage="jsonl.zst")},
+            ),
+            inputs=[],
+            config_section="data",
+        )
+    )
     p.add_node(
         Node(
             name="sink",
-            func=lambda ins, _cfg: {"n": len(ins["source"]["items"])},
+            func=lambda ins, _cfg: build_node_output(
+                status="completed",
+                summary={"n": len(ins["source"]["items"])},
+                outputs={"n": output_item("json", len(ins["source"]["items"]), storage="json")},
+            ),
             inputs=["source"],
             config_section="model",
         )
@@ -97,3 +113,11 @@ def test_cli_pipeline_report_overrides():
     assert report_cfg["format"] == "json"
     assert report_cfg["output_dir"] == "custom_reports"
     assert report_cfg["keep_last_n"] == 5
+
+
+def test_legacy_node_output_fails_fast(tmp_path):
+    p = ResearchPipeline(cache_dir=str(tmp_path / "cache"))
+    p.add_node(Node(name="legacy", func=lambda _ins, _cfg: {"x": 1}, inputs=[], config_section="data"))
+    cfg = _strict_cfg()
+    with pytest.raises(ValueError, match="typed output envelope"):
+        p.run_pipeline(cfg, materialize=["legacy"])
