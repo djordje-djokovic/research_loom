@@ -289,8 +289,20 @@ def normalize_materialize(materialize: Any) -> Any:
 
 def apply_pipeline_report_overrides(config: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
     """Apply CLI overrides to strict logging.pipeline_report config."""
+    has_override = any(
+        [
+            args.pipeline_report is not None,
+            args.pipeline_report_format is not None,
+            args.pipeline_report_dir is not None,
+            args.pipeline_report_keep_last is not None,
+        ]
+    )
+    if not has_override:
+        return config
+
     logging_cfg = config.setdefault("logging", {})
-    report_cfg = logging_cfg.setdefault("pipeline_report", {})
+    existing = logging_cfg.get("pipeline_report")
+    report_cfg = dict(existing) if isinstance(existing, dict) else {}
 
     if args.pipeline_report is not None:
         report_cfg["enabled"] = args.pipeline_report == "on"
@@ -300,6 +312,7 @@ def apply_pipeline_report_overrides(config: Dict[str, Any], args: argparse.Names
         report_cfg["output_dir"] = args.pipeline_report_dir
     if args.pipeline_report_keep_last is not None:
         report_cfg["keep_last_n"] = args.pipeline_report_keep_last
+    logging_cfg["pipeline_report"] = report_cfg
     return config
 
 

@@ -5,6 +5,7 @@ import types
 import pytest
 
 from pipeline.core import Node, ResearchPipeline
+from modeling.result_builders import build_node_output, output_item
 
 
 # Ensure imports resolve for tests run from repository root.
@@ -31,16 +32,22 @@ def call_counter() -> dict:
 def _counted_loader(counter: dict, name: str):
     def _fn(inputs, config):
         counter[name] = counter.get(name, 0) + 1
-        return {"value": config.get("value", 1)}
+        return build_node_output(
+            status="completed",
+            summary={"status": "ok"},
+            outputs={"value": output_item("json", config.get("value", 1))},
+        )
     return _fn
 
 
 def _counted_passthrough(counter: dict, name: str, input_key: str):
     def _fn(inputs, config):
         counter[name] = counter.get(name, 0) + 1
-        return {
-            "value": inputs[input_key]["value"] + config.get("delta", 0)
-        }
+        return build_node_output(
+            status="completed",
+            summary={"status": "ok"},
+            outputs={"value": output_item("json", inputs[input_key]["value"] + config.get("delta", 0))},
+        )
     return _fn
 
 

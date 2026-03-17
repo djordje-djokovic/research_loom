@@ -47,7 +47,7 @@ def simpletable(
         html.append(f'<caption>{caption}</caption>')
     
     # Header row
-    html.append('<tr style="border-bottom: 2px solid #333;">')
+    html.append('<tr>')
     for h in headers:
         html.append(f'<th>{h}</th>')
     html.append('</tr>')
@@ -62,7 +62,7 @@ def simpletable(
     html.append('</table>')
     
     if footer:
-        html.append(f'<p style="font-size:smaller">{footer}</p>')
+        html.append(f'<p class="rl-note">{footer}</p>')
     
     return '\n'.join(html)
 
@@ -118,7 +118,7 @@ def descriptive_stats_table(
     html.append(f'<caption>{caption}</caption>')
     
     # Header
-    html.append('<tr style="border-bottom: 2px solid #333;">')
+    html.append('<tr>')
     html.append('<th>Variable</th><th>Mean</th><th>SD</th><th>Min</th><th>Median</th><th>Max</th>')
     html.append('</tr>')
     
@@ -212,7 +212,7 @@ def correlation_matrix_table(
     html.append(f'<caption>{caption}</caption>')
     
     # Header with variable numbers
-    html.append('<tr style="border-bottom: 2px solid #333;">')
+    html.append('<tr>')
     html.append('<th></th>')
     for i in range(len(available_vars)):
         html.append(f'<th>({i+1})</th>')
@@ -249,7 +249,7 @@ def correlation_matrix_table(
     html.append('</table>')
     
     if show_significance:
-        html.append('<p style="font-size:smaller">* p < .05, ** p < .01, *** p < .001</p>')
+        html.append('<p class="rl-note">* p < .05, ** p < .01, *** p < .001</p>')
     
     return '\n'.join(html)
 
@@ -384,7 +384,7 @@ def regression_table(
         html.append(f'<tr><td colspan="5">Pseudo R-squared: {model_result["pseudo_r2"]:.4f}</td></tr>')
     
     # Header
-    html.append('<tr style="border-bottom: 2px solid #333;">')
+    html.append('<tr>')
     html.append('<th>Variable</th><th>Coef</th><th>Std.Err</th><th>P>|z|</th><th>Sig</th>')
     html.append('</tr>')
     
@@ -411,7 +411,7 @@ def regression_table(
         html.append('</tr>')
     
     html.append('</table>')
-    html.append('<p style="font-size:smaller">* p < .05, ** p < .01, *** p < .001</p>')
+    html.append('<p class="rl-note">* p < .05, ** p < .01, *** p < .001</p>')
     
     return '\n'.join(html)
 
@@ -448,7 +448,7 @@ def combined_regression_table(
     html.append(f'<caption><b>{title or "Regression Results"}</b></caption>')
     
     # Header row
-    html.append('<tr style="border-bottom: 2px solid #333;">')
+    html.append('<tr>')
     html.append('<th>Variable</th>')
     for i, name in enumerate(model_order):
         label = model_labels.get(name, name)
@@ -490,9 +490,9 @@ def combined_regression_table(
                 
                 sig = _sig_stars(pval)
                 
-                cell = f'<td>{coef:.4f}{sig}<br/><span style="color:#666">({se:.4f})</span>'
+                cell = f'<td>{coef:.4f}{sig}<br/><span class="rl-muted">({se:.4f})</span>'
                 if show_p_values:
-                    cell += f'<br/><span style="font-size:smaller">p={pval:.4f}</span>'
+                    cell += f'<br/><span class="rl-note">p={pval:.4f}</span>'
                 cell += '</td>'
                 html.append(cell)
             else:
@@ -501,7 +501,7 @@ def combined_regression_table(
         html.append('</tr>')
     
     # N row
-    html.append('<tr style="border-top: 1px solid #333;">')
+    html.append('<tr>')
     html.append('<td><b>N</b></td>')
     for name in model_order:
         model = models.get(name, {})
@@ -519,6 +519,6 @@ def combined_regression_table(
     html.append('</tr>')
     
     html.append('</table>')
-    html.append('<p style="font-size:smaller">Standard errors in parentheses. * p < .05, ** p < .01, *** p < .001</p>')
+    html.append('<p class="rl-note">Standard errors in parentheses. * p < .05, ** p < .01, *** p < .001</p>')
     
     return '\n'.join(html)

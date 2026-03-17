@@ -36,9 +36,9 @@ def test_build_sample_metrics_and_model_result_contract():
     assert result["sample_metrics"]["n_rows_model"] == 2
     assert result["n_companies_used"] == 1
     wrapped = wrap_node_output("model_results", result, {"x": 1})
-    assert "model_results" in wrapped
-    assert "config_hash" in wrapped
-    assert "timestamp" in wrapped
+    assert "outputs" in wrapped and "model_results" in wrapped["outputs"]
+    assert "config_hash" in wrapped["summary"]
+    assert "timestamp" in wrapped["summary"]
 
 
 def test_empty_sample_metrics_contract():

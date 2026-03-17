@@ -4,19 +4,28 @@ from pathlib import Path
 import pytest
 
 from pipeline.core import Node, ResearchPipeline
+from modeling.result_builders import build_node_output, output_item
 
 
 def _source(inputs, config):
-    return {"records": [{"id": 1, "v": "a"}, {"id": 2, "v": "b"}]}
+    return build_node_output(
+        status="completed",
+        summary={"status": "ok"},
+        outputs={"records": output_item("jsonl", [{"id": 1, "v": "a"}, {"id": 2, "v": "b"}])},
+    )
 
 
 def _sink(inputs, config):
     # Preserve artifacts from source in result lineage while adding a new artifact.
     source_rows = inputs["source"]["records"]
-    return {
-        "source_records": source_rows,
-        "summary": {"count": len(source_rows)},
-    }
+    return build_node_output(
+        status="completed",
+        summary={"status": "ok"},
+        outputs={
+            "source_records": output_item("jsonl", source_rows),
+            "summary": output_item("json", {"count": len(source_rows)}),
+        },
+    )
 
 
 @pytest.mark.core

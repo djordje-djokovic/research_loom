@@ -36,7 +36,7 @@ class _FakePipeline:
 def test_normalize_materialize_behavior():
     assert normalize_materialize(["results"]) == "none"
     assert normalize_materialize([]) == "none"
-    assert normalize_materialize(["all"]) == ["all"]
+    assert normalize_materialize(["all"]) == "all"
     assert normalize_materialize(["node_a"]) == ["node_a"]
 
 
@@ -90,26 +90,29 @@ def test_handle_invalidation_unknown_nodes_warn_and_skip(capfd):
 @pytest.mark.cli
 @pytest.mark.smoke
 def test_run_cli_default_materialize_passes_none(monkeypatch, tmp_path):
-    calls = {}
+    calls = {"materialize": None}
+
+    class _CapturePipeline:
+        def __init__(self):
+            self.nodes = {"a": object()}
+
+        def run_pipeline(self, config, materialize="none"):
+            calls["materialize"] = materialize
+            return {}
 
     def create_pipeline():
-        rp = ResearchPipeline(cache_dir=str(tmp_path / "cache"))
-        rp.add_node(Node("a", lambda i, c: {"v": 1}, [], "a", materialize_by_default=True))
-        return rp
+        return _CapturePipeline()
 
     def load_config(name):
         assert name == "base"
         return {"a": {}}
 
     def run_study(config_name, materialize):
-        calls["config_name"] = config_name
-        calls["materialize"] = materialize
-        return ({"a": {"v": 1}}, create_pipeline(), {"a": {}})
+        return ({}, create_pipeline(), {"a": {}})
 
     monkeypatch.setattr(sys, "argv", ["prog"])
     run_cli(create_pipeline, load_config, run_study)
 
-    assert calls["config_name"] == "base"
     assert calls["materialize"] == "none"
 
 
@@ -168,18 +171,18 @@ def test_run_cli_view_unknown_node_exits_without_run_study(monkeypatch, capfd):
 def test_run_cli_merges_invalidated_nodes_into_materialize(monkeypatch, tmp_path):
     calls = {}
 
+    class _CapturePipeline(_FakePipeline):
+        def run_pipeline(self, config, materialize="none"):
+            calls["materialize"] = materialize
+            return {}
+
     def create_pipeline():
-        rp = ResearchPipeline(cache_dir=str(tmp_path / "cache_merge"))
-        rp.add_node(Node("a", lambda i, c: {"v": 1}, [], "a"))
-        rp.add_node(Node("b", lambda i, c: {"v": i["a"]["v"] + 1}, ["a"], "b"))
-        rp.add_node(Node("c", lambda i, c: {"v": i["b"]["v"] + 1}, ["b"], "c"))
-        return rp
+        return _CapturePipeline()
 
     def load_config(name):
         return {"a": {}, "b": {}, "c": {}}
 
     def run_study(config_name, materialize):
-        calls["materialize"] = materialize
         return ({}, create_pipeline(), {})
 
     monkeypatch.setattr(

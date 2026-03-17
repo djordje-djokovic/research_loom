@@ -1,15 +1,24 @@
 import pytest
 
 from pipeline.core import Node
+from modeling.result_builders import build_node_output, output_item
 
 
 def _identity_loader(inputs, config):
-    return {"value": config.get("value", 1)}
+    return build_node_output(
+        status="completed",
+        summary={"status": "ok"},
+        outputs={"value": output_item("json", config.get("value", 1))},
+    )
 
 
 def _from_input(input_name):
     def _fn(inputs, config):
-        return {"value": inputs[input_name]["value"] + config.get("delta", 0)}
+        return build_node_output(
+            status="completed",
+            summary={"status": "ok"},
+            outputs={"value": output_item("json", inputs[input_name]["value"] + config.get("delta", 0))},
+        )
     return _fn
 
 

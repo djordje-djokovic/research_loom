@@ -28,6 +28,20 @@ import hashlib
 import json
 import numpy as np
 
+def _common_metadata(config):
+    return {
+        "timestamp": time.time(),
+        "config_hash": hashlib.md5(json.dumps(config, sort_keys=True).encode()).hexdigest()[:8],
+    }
+
+
+def _node_output(status, summary, outputs, config, metadata=None):
+    merged_metadata = _common_metadata(config)
+    if metadata:
+        merged_metadata.update(metadata)
+    return build_node_output(status=status, summary=summary, outputs=outputs, metadata=merged_metadata)
+
+
 # Optional imports for enhanced features
 try:
     import pandas as pd
@@ -57,7 +71,7 @@ def load_raw_data(inputs, config):
     print(f"Loading raw data from {source}...")
     time.sleep(0.1)  # Simulate data loading
     
-    return build_node_output(
+    return _node_output(
         status="completed",
         summary={"source": source, "sample_size": sample_size},
         outputs={
@@ -65,10 +79,7 @@ def load_raw_data(inputs, config):
             "sample_size": output_item("json", sample_size, storage="json"),
             "source": output_item("text", source, storage="txt"),
         },
-        metadata={
-            "timestamp": time.time(),
-            "config_hash": hashlib.md5(json.dumps(config, sort_keys=True).encode()).hexdigest()[:8],
-        },
+        config=config,
     )
 
 
@@ -98,7 +109,7 @@ def process_dataframe(inputs, config):
         "score": np.random.uniform(0, 100, sample_size),
     })
     
-    return build_node_output(
+    return _node_output(
         status="completed",
         summary={"rows": len(df)},
         outputs={
@@ -110,10 +121,7 @@ def process_dataframe(inputs, config):
                 preview="json",
             ),
         },
-        metadata={
-            "timestamp": time.time(),
-            "config_hash": hashlib.md5(json.dumps(config, sort_keys=True).encode()).hexdigest()[:8],
-        },
+        config=config,
     )
 
 
@@ -170,14 +178,11 @@ def create_visualization(inputs, config):
         height=600,
     )
     
-    return build_node_output(
+    return _node_output(
         status="completed",
         summary={"status": "ok"},
         outputs={"figure": output_item("figure", fig, storage="html", preview="figure")},
-        metadata={
-            "timestamp": time.time(),
-            "config_hash": hashlib.md5(json.dumps(config, sort_keys=True).encode()).hexdigest()[:8],
-        },
+        config=config,
     )
 
 
@@ -217,14 +222,11 @@ def calculate_statistics(inputs, config):
             "mean_value": float(cat_data["value"].mean()),
         }
     
-    return build_node_output(
+    return _node_output(
         status="completed",
         summary={"status": "ok"},
         outputs={"statistics": output_item("json", stats, storage="json.zst", preview="json")},
-        metadata={
-            "timestamp": time.time(),
-            "config_hash": hashlib.md5(json.dumps(config, sort_keys=True).encode()).hexdigest()[:8],
-        },
+        config=config,
     )
 
 
@@ -256,14 +258,11 @@ def generate_report(inputs, config):
         "timestamp": time.time(),
     }
     
-    return build_node_output(
+    return _node_output(
         status="completed",
         summary={"status": "ok"},
         outputs={"report": output_item("json", report, storage="json.zst", preview="json")},
-        metadata={
-            "timestamp": time.time(),
-            "config_hash": hashlib.md5(json.dumps(config, sort_keys=True).encode()).hexdigest()[:8],
-        },
+        config=config,
     )
 
 

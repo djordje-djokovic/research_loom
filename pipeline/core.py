@@ -396,6 +396,11 @@ class ResearchPipeline:
             "n_cached": n_cached,
             "n_failed": n_failed,
         }
+        sorted_sections = sorted(config.keys()) if isinstance(config, dict) else []
+        effective_config = {
+            sec: self.redact_config(sec, config.get(sec, {}))
+            for sec in sorted_sections
+        }
         top_bottlenecks = [
             {"name": row["name"], "elapsed_s": row["elapsed_s"]}
             for row in sorted(nodes_rows, key=lambda item: item["elapsed_s"], reverse=True)[:5]
@@ -412,7 +417,8 @@ class ResearchPipeline:
             "materialize": original_materialize if isinstance(original_materialize, str) else list(original_materialize),
             "outputs": outputs,
             "required_nodes": sorted(required),
-            "config_hashes": {sec: self.get_config_hash(config, sec) for sec in sorted(config.keys())},
+            "config_hashes": {sec: self.get_config_hash(config, sec) for sec in sorted_sections},
+            "effective_config": effective_config,
             "summary": summary,
             "top_bottlenecks": top_bottlenecks,
             "layout": {
@@ -2185,22 +2191,7 @@ body > div {{
     def _find_visualization_path(self, result: Any) -> Optional[Path]:
         """Find HTML visualization file path from result"""
         if isinstance(result, dict):
-            # Check for visualization_path key (legacy format - can be string or artifact pointer)
-            if "visualization_path" in result:
-                path_val = result["visualization_path"]
-                if path_val:
-                    if isinstance(path_val, str):
-                        html_path = Path(path_val)
-                        if html_path.exists():
-                            return html_path
-                    elif isinstance(path_val, dict) and path_val.get("__artifact__"):
-                        # It's an artifact pointer - resolve it
-                        if path_val.get("format") == "html":
-                            artifact_path = (self.cache_dir / path_val["path"]).resolve()
-                            if artifact_path.exists():
-                                return artifact_path
-            
-            # Check for figure artifact (HTML format) - new format
+            # Check for figure artifact (HTML format)
             if "figure" in result:
                 fig_path = result["figure"]
                 if isinstance(fig_path, str):
@@ -2301,17 +2292,6 @@ body > div {{
             print(f"\nResult type: {type(result).__name__}")
             if isinstance(result, (str, int, float, bool)):
                 print(f"Value: {result}")
-
-    def _iter_artifact_ptrs(self, obj):
-        """Yield every artifact pointer found recursively in obj."""
-        if isinstance(obj, dict):
-            if obj.get("__artifact__"):
-                yield obj
-            for v in obj.values():
-                yield from self._iter_artifact_ptrs(v)
-        elif isinstance(obj, (list, tuple)):
-            for it in obj:
-                yield from self._iter_artifact_ptrs(it)
 
     def export_node(
         self,

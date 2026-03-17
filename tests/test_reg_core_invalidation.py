@@ -1,15 +1,24 @@
 import pytest
 
 from pipeline.core import Node, ResearchPipeline
+from modeling.result_builders import build_node_output, output_item
 
 
 def _source(inputs, config):
-    return {"value": config.get("v", 1)}
+    return build_node_output(
+        status="completed",
+        summary={"status": "ok"},
+        outputs={"value": output_item("json", config.get("v", 1))},
+    )
 
 
 def _add(input_name):
     def _fn(inputs, config):
-        return {"value": inputs[input_name]["value"] + config.get("d", 0)}
+        return build_node_output(
+            status="completed",
+            summary={"status": "ok"},
+            outputs={"value": output_item("json", inputs[input_name]["value"] + config.get("d", 0))},
+        )
     return _fn
 
 

@@ -17,4 +17,6 @@ def test_example_study_pipeline_contract(tmp_path):
     results = pipe.run_pipeline(cfg, materialize=["processed_dataframe"])
     assert "processed_dataframe" in results
     payload = results["processed_dataframe"]
-    assert "processed_df" in payload
+    assert payload["status"] == "completed"
+    assert "processed_df" in payload["outputs"]
+    assert "summary" in payload["outputs"]

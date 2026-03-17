@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import csv
-import json as pyjson
 import json
 import re
 import shutil
@@ -24,6 +23,19 @@ REQUIRED_REPORT_KEYS = {
     "layout",
 }
 ALLOWED_FORMATS = {"json", "html", "both"}
+DEFAULT_REPORT_CONFIG = {
+    "enabled": False,
+    "format": "html",
+    "output_dir": "run_reports",
+    "keep_last_n": 20,
+    "include_edge_payloads": True,
+    "write_latest_pointer": True,
+    "layout": {
+        "node_spacing": 100.0,
+        "layer_spacing": 170.0,
+        "edge_node_spacing": 80.0,
+    },
+}
 
 
 def utc_now_iso() -> str:
@@ -35,7 +47,13 @@ def create_run_id() -> str:
     return f"{ts}_{uuid4().hex[:8]}"
 
 
-def validate_report_config(report_cfg: Dict[str, Any]) -> Dict[str, Any]:
+def default_report_config() -> Dict[str, Any]:
+    return json.loads(json.dumps(DEFAULT_REPORT_CONFIG))
+
+
+def validate_report_config(report_cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if report_cfg is None:
+        report_cfg = default_report_config()
     if not isinstance(report_cfg, dict):
         raise ValueError("logging.pipeline_report must be an object")
     missing = sorted(REQUIRED_REPORT_KEYS - set(report_cfg.keys()))
@@ -219,7 +237,7 @@ def _extract_preview_rows(artifact_path: Path, fmt: str, max_rows: int = 40) -> 
                     rows.append(dict(row))
                 return {"columns": list(reader.fieldnames or []), "rows": rows, "row_count": len(rows)}
         if lower == "json":
-            payload = pyjson.loads(artifact_path.read_text(encoding="utf-8"))
+            payload = json.loads(artifact_path.read_text(encoding="utf-8"))
             return _rows_from_object(payload, max_rows=max_rows)
         if lower in {"json.zst", "jsonl.zst"}:
             import zstandard as zstd
@@ -234,13 +252,13 @@ def _extract_preview_rows(artifact_path: Path, fmt: str, max_rows: int = 40) -> 
                     if not line.strip():
                         continue
                     try:
-                        out.append(pyjson.loads(line))
+                        out.append(json.loads(line))
                     except Exception:
                         continue
                     if len(out) >= max_rows:
                         break
                 return _rows_from_object(out, max_rows=max_rows)
-            payload = pyjson.loads(raw)
+            payload = json.loads(raw)
             return _rows_from_object(payload, max_rows=max_rows)
         if lower == "parquet":
             import pandas as pd
@@ -302,7 +320,7 @@ def build_node_inspector_html(envelope: Dict[str, Any], node_name: str, title: O
         if isinstance(val, dict) and val.get("__artifact__"):
             rendered = f"artifact: {_escape(val.get('path'))} ({_escape(val.get('format'))})"
         elif isinstance(val, (dict, list)):
-            rendered = _escape(pyjson.dumps(val, ensure_ascii=False)[:1000])
+            rendered = _escape(json.dumps(val, ensure_ascii=False)[:1000])
         else:
             rendered = _escape(str(val))
         output_rows.append(
@@ -317,8 +335,8 @@ def build_node_inspector_html(envelope: Dict[str, Any], node_name: str, title: O
     if not output_rows:
         output_rows.append("<tr><td colspan='5'><i>No outputs</i></td></tr>")
 
-    summary_json = _escape(pyjson.dumps(envelope.get("summary", {}), ensure_ascii=False, indent=2))
-    metadata_json = _escape(pyjson.dumps(envelope.get("metadata", {}), ensure_ascii=False, indent=2))
+    summary_json = _escape(json.dumps(envelope.get("summary", {}), ensure_ascii=False, indent=2))
+    metadata_json = _escape(json.dumps(envelope.get("metadata", {}), ensure_ascii=False, indent=2))
     page_title = title or f"Node Inspector - {node_name}"
     body_html = f"""
   <h2>{_escape(page_title)}</h2>
@@ -365,7 +383,7 @@ def _select_primary_artifact(artifact_links: List[Dict[str, Any]]) -> Optional[D
 
 
 def _build_enriched_manifest(manifest: Dict[str, Any], output_dir: Path, include_previews: bool) -> Dict[str, Any]:
-    data = pyjson.loads(pyjson.dumps(manifest))
+    data = json.loads(json.dumps(manifest))
     run_id = str(data.get("run_id") or "run")
     previews_dir = output_dir / "previews"
     if include_previews:
@@ -379,7 +397,7 @@ def _build_enriched_manifest(manifest: Dict[str, Any], output_dir: Path, include
             cache_path = Path(cache_file_path)
             if cache_path.exists():
                 try:
-                    cache_blob = pyjson.loads(cache_path.read_text(encoding="utf-8"))
+                    cache_blob = json.loads(cache_path.read_text(encoding="utf-8"))
                     envelope = cache_blob.get("_result") if isinstance(cache_blob, dict) else None
                     if isinstance(envelope, dict) and "outputs" in envelope and "status" in envelope:
                         inspector_name = f"{run_id}_{_slugify(str(node.get('name')))}_inspector.html"
@@ -460,6 +478,7 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
     materialize = manifest.get("materialize")
     materialize_text = materialize if isinstance(materialize, str) else ", ".join(materialize or [])
     outputs = manifest.get("outputs", [])
+    effective_config_data_json = json.dumps(manifest.get("effective_config", {}), ensure_ascii=False)
     shared_css = get_shared_html_css()
     html = f"""<!doctype html>
 <html>
@@ -496,6 +515,150 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
       word-break: break-word;
     }}
     .runbar b {{ color: #93c5fd; }}
+    .run-config details {{
+      margin-top: 8px;
+      border-top: 1px solid #334155;
+      padding-top: 6px;
+    }}
+    .run-config summary {{
+      cursor: pointer;
+      user-select: none;
+      color: #93c5fd;
+      font-weight: 600;
+    }}
+    .run-config .toolbar {{
+      margin-top: 8px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+    }}
+    .run-config .cfg-btn {{
+      border: 1px solid #475569;
+      background: #1e293b;
+      color: #cbd5e1;
+      border-radius: 6px;
+      padding: 3px 8px;
+      cursor: pointer;
+      font-size: 12px;
+      font-family: inherit;
+    }}
+    .run-config .cfg-btn:hover {{
+      border-color: #60a5fa;
+      color: #e2e8f0;
+    }}
+    .run-config .cfg-search {{
+      margin-left: auto;
+      min-width: 220px;
+      width: min(460px, 100%);
+      border: 1px solid #334155;
+      border-radius: 6px;
+      background: #0b1220;
+      color: #e2e8f0;
+      padding: 5px 8px;
+      font-size: 12px;
+      font-family: inherit;
+    }}
+    .run-config .cfg-tree-wrap {{
+      margin-top: 8px;
+      max-height: 320px;
+      overflow: auto;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      background: rgba(15, 23, 42, 0.75);
+      padding: 8px 10px;
+    }}
+    .cfg-tree, .cfg-tree ul {{
+      list-style: none;
+      margin: 0;
+      padding-left: 16px;
+    }}
+    .cfg-tree > li {{
+      padding-left: 0;
+    }}
+    .cfg-item {{
+      margin: 2px 0;
+      line-height: 1.35;
+    }}
+    .cfg-key {{
+      color: #93c5fd;
+      font-weight: 700;
+    }}
+    .cfg-value-string {{
+      color: #86efac;
+    }}
+    .cfg-value-number {{
+      color: #fca5a5;
+    }}
+    .cfg-value-bool {{
+      color: #fcd34d;
+    }}
+    .cfg-value-null {{
+      color: #94a3b8;
+      font-style: italic;
+    }}
+    .cfg-toggle {{
+      display: inline-block;
+      width: 14px;
+      cursor: pointer;
+      color: #cbd5e1;
+      user-select: none;
+    }}
+    .cfg-node-children {{
+      margin-left: 8px;
+      border-left: 1px dashed #334155;
+      padding-left: 8px;
+    }}
+    .cfg-collapsed > .cfg-node-children {{
+      display: none;
+    }}
+    .cfg-match {{
+      background: rgba(250, 204, 21, 0.22);
+      border-radius: 3px;
+      padding: 0 2px;
+    }}
+    .cfg-modal {{
+      position: fixed;
+      inset: 0;
+      background: rgba(2, 6, 23, 0.65);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 9800;
+      padding: 18px;
+    }}
+    .cfg-modal.open {{
+      display: flex;
+    }}
+    .cfg-modal-card {{
+      width: min(1200px, 96vw);
+      height: min(88vh, 900px);
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      box-shadow: 0 16px 46px rgba(0, 0, 0, 0.5);
+      display: flex;
+      flex-direction: column;
+      padding: 10px 12px;
+    }}
+    .cfg-modal-header {{
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 8px;
+    }}
+    .cfg-modal-title {{
+      color: #93c5fd;
+      font-weight: 700;
+      font-size: 13px;
+    }}
+    .cfg-modal-body {{
+      overflow: auto;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      background: rgba(15, 23, 42, 0.75);
+      padding: 8px 10px;
+    }}
     #nodeTable th {{ cursor: pointer; }}
     .dag-tooltip {{
       position: fixed;
@@ -606,6 +769,19 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
     <b>Outputs:</b> {len(outputs)} |
     <b>Started:</b> {_escape(manifest.get("started_at"))} |
     <b>Ended:</b> {_escape(manifest.get("ended_at"))}
+    <div class="run-config">
+      <details>
+        <summary>Effective Config (redacted)</summary>
+        <div class="toolbar">
+          <button id="cfgExpandAll" class="cfg-btn" type="button">Expand all</button>
+          <button id="cfgCollapseAll" class="cfg-btn" type="button">Collapse all</button>
+          <button id="cfgCopyJson" class="cfg-btn" type="button">Copy JSON</button>
+          <button id="cfgOpenModal" class="cfg-btn" type="button">Full screen</button>
+          <input id="cfgSearch" class="cfg-search" type="text" placeholder="Search key/value..." />
+        </div>
+        <div id="cfgTreeWrap" class="cfg-tree-wrap"></div>
+      </details>
+    </div>
   </div>
   <div class="card">
     <svg id="dagSvg" viewBox="0 0 1800 900" width="100%" height="780" role="img"></svg>
@@ -631,6 +807,15 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
     </table>
   </div>
   <div id="dagTooltip" class="dag-tooltip"></div>
+  <div id="cfgModal" class="cfg-modal">
+    <div class="cfg-modal-card">
+      <div class="cfg-modal-header">
+        <span class="cfg-modal-title">Effective Config (redacted)</span>
+        <button id="cfgModalClose" class="cfg-btn" type="button" style="margin-left:auto;">Close</button>
+      </div>
+      <div id="cfgModalBody" class="cfg-modal-body"></div>
+    </div>
+  </div>
   <div id="drawerBackdrop" class="drawer-backdrop"></div>
   <div id="artifactPanel" class="artifact-panel">
     <button id="artifactPanelClose" class="artifact-close">Close</button>
@@ -641,6 +826,7 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
     const manifestNodes = {nodes_json};
     const manifestEdges = {edges_json};
     const manifestLayout = {layout_settings_json};
+    const effectiveConfig = {effective_config_data_json};
     const NS = 'http://www.w3.org/2000/svg';
 
     function nodeColor(status) {{
@@ -699,6 +885,105 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
         .replaceAll('>', '&gt;')
         .replaceAll('"', '&quot;')
         .replaceAll("'", '&#39;');
+    }}
+
+    function cfgValueHtml(value) {{
+      if (value === null) return '<span class="cfg-value-null">null</span>';
+      const t = typeof value;
+      if (t === 'string') return `<span class="cfg-value-string">"${{escapeHtml(value)}}"</span>`;
+      if (t === 'number') return `<span class="cfg-value-number">${{escapeHtml(String(value))}}</span>`;
+      if (t === 'boolean') return `<span class="cfg-value-bool">${{value ? 'true' : 'false'}}</span>`;
+      return `<span>${{escapeHtml(String(value))}}</span>`;
+    }}
+
+    function buildCfgNode(key, value, path) {{
+      const li = document.createElement('li');
+      li.className = 'cfg-item';
+      li.setAttribute('data-cfg-path', path || key || 'root');
+      li.setAttribute('data-cfg-label', `${{key ?? ''}} ${{typeof value === 'object' ? '' : String(value ?? '')}}`.toLowerCase());
+      const row = document.createElement('div');
+
+      const isObject = value && typeof value === 'object';
+      if (isObject) {{
+        const isArray = Array.isArray(value);
+        const entries = isArray ? value.map((v, i) => [String(i), v]) : Object.entries(value);
+        const toggle = document.createElement('span');
+        toggle.className = 'cfg-toggle';
+        toggle.textContent = '▾';
+        row.appendChild(toggle);
+        row.insertAdjacentHTML('beforeend', `<span class="cfg-key">${{escapeHtml(key)}}</span>: <span class="cfg-value-null">${{isArray ? `Array(${{entries.length}})` : `Object(${{entries.length}})`}}</span>`);
+        li.appendChild(row);
+        const ul = document.createElement('ul');
+        ul.className = 'cfg-node-children';
+        entries.forEach(([k, v]) => {{
+          ul.appendChild(buildCfgNode(k, v, path ? `${{path}}.${{k}}` : k));
+        }});
+        li.appendChild(ul);
+        const setCollapsed = (collapsed) => {{
+          li.classList.toggle('cfg-collapsed', collapsed);
+          toggle.textContent = collapsed ? '▸' : '▾';
+        }};
+        toggle.addEventListener('click', () => setCollapsed(!li.classList.contains('cfg-collapsed')));
+        row.addEventListener('dblclick', () => setCollapsed(!li.classList.contains('cfg-collapsed')));
+      }} else {{
+        row.innerHTML = `<span class="cfg-toggle"></span><span class="cfg-key">${{escapeHtml(key)}}</span>: ${{cfgValueHtml(value)}}`;
+        li.appendChild(row);
+      }}
+      return li;
+    }}
+
+    function setAllCfgCollapsed(root, collapsed) {{
+      root.querySelectorAll('.cfg-item').forEach((item) => {{
+        const hasChildren = item.querySelector(':scope > .cfg-node-children');
+        if (!hasChildren) return;
+        item.classList.toggle('cfg-collapsed', collapsed);
+        const toggle = item.querySelector(':scope > div > .cfg-toggle');
+        if (toggle) toggle.textContent = collapsed ? '▸' : '▾';
+      }});
+    }}
+
+    function filterCfgTree(root, term) {{
+      const q = String(term || '').trim().toLowerCase();
+      const items = root.querySelectorAll('.cfg-item');
+      items.forEach((item) => {{
+        item.classList.remove('cfg-match');
+      }});
+      if (!q) {{
+        items.forEach((item) => {{ item.style.display = ''; }});
+        return;
+      }}
+      const matches = new Set();
+      items.forEach((item) => {{
+        const label = item.getAttribute('data-cfg-label') || '';
+        if (label.includes(q)) {{
+          matches.add(item);
+          item.classList.add('cfg-match');
+          let p = item.parentElement;
+          while (p) {{
+            const owner = p.closest('.cfg-item');
+            if (!owner) break;
+            matches.add(owner);
+            owner.classList.remove('cfg-collapsed');
+            const toggle = owner.querySelector(':scope > div > .cfg-toggle');
+            if (toggle) toggle.textContent = '▾';
+            p = owner.parentElement;
+          }}
+        }}
+      }});
+      items.forEach((item) => {{
+        item.style.display = matches.has(item) ? '' : 'none';
+      }});
+    }}
+
+    function renderConfigTree(targetId, value) {{
+      const host = document.getElementById(targetId);
+      if (!host) return null;
+      host.innerHTML = '';
+      const root = document.createElement('ul');
+      root.className = 'cfg-tree';
+      root.appendChild(buildCfgNode('root', value, 'root'));
+      host.appendChild(root);
+      return root;
     }}
 
     function renderArtifactPanel(node) {{
@@ -1101,7 +1386,62 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
       sorted.forEach(r => body.appendChild(r));
     }}
 
+    function initConfigUi() {{
+      const rootMain = renderConfigTree('cfgTreeWrap', effectiveConfig);
+      const rootModal = renderConfigTree('cfgModalBody', effectiveConfig);
+      const expandBtn = document.getElementById('cfgExpandAll');
+      const collapseBtn = document.getElementById('cfgCollapseAll');
+      const copyBtn = document.getElementById('cfgCopyJson');
+      const search = document.getElementById('cfgSearch');
+      const modal = document.getElementById('cfgModal');
+      const modalOpen = document.getElementById('cfgOpenModal');
+      const modalClose = document.getElementById('cfgModalClose');
+
+      if (collapseBtn && rootMain && rootModal) {{
+        collapseBtn.onclick = () => {{
+          setAllCfgCollapsed(rootMain, true);
+          setAllCfgCollapsed(rootModal, true);
+        }};
+      }}
+      if (expandBtn && rootMain && rootModal) {{
+        expandBtn.onclick = () => {{
+          setAllCfgCollapsed(rootMain, false);
+          setAllCfgCollapsed(rootModal, false);
+        }};
+      }}
+      if (copyBtn) {{
+        copyBtn.onclick = async () => {{
+          const txt = JSON.stringify(effectiveConfig, null, 2);
+          try {{
+            await navigator.clipboard.writeText(txt);
+            copyBtn.textContent = 'Copied';
+            setTimeout(() => {{ copyBtn.textContent = 'Copy JSON'; }}, 1200);
+          }} catch (_err) {{
+            copyBtn.textContent = 'Copy failed';
+            setTimeout(() => {{ copyBtn.textContent = 'Copy JSON'; }}, 1200);
+          }}
+        }};
+      }}
+      if (search && rootMain && rootModal) {{
+        search.oninput = () => {{
+          filterCfgTree(rootMain, search.value);
+          filterCfgTree(rootModal, search.value);
+        }};
+      }}
+      if (modal && modalOpen && modalClose) {{
+        modalOpen.onclick = () => modal.classList.add('open');
+        modalClose.onclick = () => modal.classList.remove('open');
+        modal.onclick = (ev) => {{ if (ev.target === modal) modal.classList.remove('open'); }};
+        window.addEventListener('keydown', (ev) => {{
+          if (ev.key === 'Escape') modal.classList.remove('open');
+        }});
+      }}
+      if (rootMain) setAllCfgCollapsed(rootMain, true);
+      if (rootModal) setAllCfgCollapsed(rootModal, true);
+    }}
+
     (async function initDag() {{
+      initConfigUi();
       const dims = buildDims(manifestNodes);
       try {{
         const layout = await elkLayout(manifestNodes, manifestEdges, dims, manifestLayout);

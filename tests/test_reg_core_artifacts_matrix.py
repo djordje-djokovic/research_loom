@@ -3,12 +3,28 @@ from pathlib import Path
 import pytest
 
 from pipeline.core import Node, ResearchPipeline
+from modeling.result_builders import build_node_output, output_item
 
 
 def _node_with_output(key, value):
     def _fn(inputs, config):
-        return {key: value}
+        output_type = "json"
+        if hasattr(value, "to_html") and hasattr(value, "to_json"):
+            output_type = "dataframe"
+        elif value.__class__.__module__.startswith("plotly"):
+            output_type = "figure"
+        elif value.__class__.__module__.startswith("matplotlib"):
+            output_type = "figure"
+        return build_node_output(
+            status="completed",
+            summary={"status": "ok"},
+            outputs={key: output_item(output_type, value)},
+        )
     return _fn
+
+
+def _value(result, key):
+    return result["outputs"][key]["value"]
 
 
 @pytest.mark.core
@@ -30,7 +46,7 @@ def test_json_zst_roundtrip(tmp_path):
     )
     cfg = {"n": {}}
     out = p.run_pipeline(cfg, materialize=["n"])
-    ptr = out["n"]["result"]
+    ptr = _value(out["n"], "result")
     assert ptr["__artifact__"] is True
     assert ptr["format"] == "json.zst"
     loaded = p._load_artifact(ptr)
@@ -56,7 +72,7 @@ def test_jsonl_zst_roundtrip(tmp_path):
     )
     cfg = {"n": {}}
     out = p.run_pipeline(cfg, materialize=["n"])
-    ptr = out["n"]["rows"]
+    ptr = _value(out["n"], "rows")
     assert ptr["format"] == "jsonl.zst"
     loaded = p._load_artifact(ptr)
     assert loaded == rows
@@ -82,7 +98,7 @@ def test_parquet_roundtrip(tmp_path):
 
     cfg = {"n": {}}
     out = p.run_pipeline(cfg, materialize=["n"])
-    ptr = out["n"]["df"]
+    ptr = _value(out["n"], "df")
     assert ptr["format"] == "parquet"
     loaded = p._load_artifact(ptr)
     assert list(loaded.columns) == ["id", "val"]
@@ -109,7 +125,7 @@ def test_csv_roundtrip(tmp_path):
 
     cfg = {"n": {}}
     out = p.run_pipeline(cfg, materialize=["n"])
-    ptr = out["n"]["rows"]
+    ptr = _value(out["n"], "rows")
     assert ptr["format"] == "csv"
     loaded = p._load_artifact(ptr)
     assert loaded.shape[0] == 2
@@ -135,7 +151,7 @@ def test_plotly_html_roundtrip(tmp_path):
 
     cfg = {"n": {}}
     out = p.run_pipeline(cfg, materialize=["n"])
-    ptr = out["n"]["fig"]
+    ptr = _value(out["n"], "fig")
     assert ptr["format"] == "html"
     html_path = Path(p._load_artifact(ptr))
     assert html_path.exists()
@@ -164,7 +180,7 @@ def test_matplotlib_png_roundtrip(tmp_path):
 
     cfg = {"n": {}}
     out = p.run_pipeline(cfg, materialize=["n"])
-    ptr = out["n"]["fig"]
+    ptr = _value(out["n"], "fig")
     assert ptr["format"] == "png"
     png_path = Path(p._load_artifact(ptr))
     assert png_path.exists()
@@ -187,4 +203,4 @@ def test_invalid_storage_format_falls_back_to_inline(tmp_path):
 
     cfg = {"n": {}}
     out = p.run_pipeline(cfg, materialize=["n"])
-    assert out["n"]["x"] == {"a": 1}
+    assert _value(out["n"], "x") == {"a": 1}

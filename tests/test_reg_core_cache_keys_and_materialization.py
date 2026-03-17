@@ -1,18 +1,37 @@
 import pytest
 
 from pipeline.core import Node, ResearchPipeline
+from modeling.result_builders import build_node_output, output_item
 
 
 def _source(inputs, config):
-    return {"payload": config.get("value", 1)}
+    return build_node_output(
+        status="completed",
+        summary={"status": "ok"},
+        outputs={"payload": output_item("json", config.get("value", 1))},
+    )
 
 
 def _mid(inputs, config):
-    return {"payload": inputs["source"]["payload"] + config.get("delta", 0)}
+    return build_node_output(
+        status="completed",
+        summary={"status": "ok"},
+        outputs={"payload": output_item("json", inputs["source"]["payload"] + config.get("delta", 0))},
+    )
 
 
 def _sink(inputs, config):
-    return {"payload": inputs["mid"]["payload"] + config.get("delta", 0)}
+    return build_node_output(
+        status="completed",
+        summary={"status": "ok"},
+        outputs={"payload": output_item("json", inputs["mid"]["payload"] + config.get("delta", 0))},
+    )
+
+
+def _resolved(pipeline, value):
+    if isinstance(value, dict) and value.get("__artifact__"):
+        return pipeline._load_artifact(value)
+    return value
 
 
 @pytest.mark.core
@@ -96,7 +115,7 @@ def test_materialize_explicit_node_list_returns_only_requested_nodes(
     result = p.run_pipeline(config, materialize=["mid"])
     # Current framework behavior returns computed closure members on a dirty run.
     assert "mid" in result
-    assert result["mid"]["value"] == 5
+    assert _resolved(p, result["mid"]["outputs"]["value"]["value"]) == 5
 
 
 @pytest.mark.core
@@ -116,7 +135,7 @@ def test_corrupt_nonempty_cache_is_recomputed(tmp_path):
 
     second = p.run_pipeline(config, materialize=["mid"])
     assert "mid" in second
-    assert second["mid"]["payload"] == 5
+    assert _resolved(p, second["mid"]["outputs"]["payload"]["value"]) == 5
 
 
 @pytest.mark.core
