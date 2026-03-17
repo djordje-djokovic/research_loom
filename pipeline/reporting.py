@@ -291,7 +291,7 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
         )
         label = _escape(name)
         sub = _escape(f"{node.get('status')} | {node.get('elapsed_s', 0.0):.2f}s")
-        svg_lines.append(f'<text data-node-label="{_escape(name)}" x="{pos["x"]:.1f}" y="{(pos["y"]-6):.1f}" text-anchor="middle" fill="#f7fafc" font-size="13" font-family="Segoe UI, Arial" style="pointer-events:none;">{label}</text>')
+        svg_lines.append(f'<text data-node-label="{_escape(name)}" x="{pos["x"]:.1f}" y="{(pos["y"]-6):.1f}" text-anchor="middle" fill="#f7fafc" font-size="13" font-family="Segoe UI, Arial" font-weight="700" style="pointer-events:none;">{label}</text>')
         svg_lines.append(f'<text data-node-sub="{_escape(name)}" x="{pos["x"]:.1f}" y="{(pos["y"]+14):.1f}" text-anchor="middle" fill="#edf2f7" font-size="11" font-family="Segoe UI, Arial" style="pointer-events:none;">{sub}</text>')
 
     svg_lines.append("</svg>")
@@ -437,6 +437,9 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
           if (idx > 0) {{
             const k = line.slice(0, idx + 1);
             const v = line.slice(idx + 1);
+            if (k === 'Node:') {{
+              return `<div class="row"><span class="k">${{k}}</span><b>${{v}}</b></div>`;
+            }}
             return `<div class="row"><span class="k">${{k}}</span>${{v}}</div>`;
           }}
           return `<div class="row">${{line}}</div>`;
