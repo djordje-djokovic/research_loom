@@ -382,6 +382,16 @@ def _select_primary_artifact(artifact_links: List[Dict[str, Any]]) -> Optional[D
     return best
 
 
+def _write_latest_preview_alias(source_path: Path, previews_dir: Path, alias_name: str) -> Optional[Path]:
+    """Write/update a stable preview alias file under previews/."""
+    try:
+        alias_path = previews_dir / alias_name
+        shutil.copyfile(source_path, alias_path)
+        return alias_path
+    except Exception:
+        return None
+
+
 def _build_enriched_manifest(manifest: Dict[str, Any], output_dir: Path, include_previews: bool) -> Dict[str, Any]:
     data = json.loads(json.dumps(manifest))
     run_id = str(data.get("run_id") or "run")
@@ -392,6 +402,8 @@ def _build_enriched_manifest(manifest: Dict[str, Any], output_dir: Path, include
     for node in data.get("nodes", []):
         artifact_links: List[Dict[str, Any]] = []
         inspector_href = None
+        inspector_latest_href = None
+        node_slug = _slugify(str(node.get("name")))
         cache_file_path = str(node.get("cache_file_path") or "").strip()
         if include_previews and cache_file_path:
             cache_path = Path(cache_file_path)
@@ -405,11 +417,20 @@ def _build_enriched_manifest(manifest: Dict[str, Any], output_dir: Path, include
                         inspector_html = build_node_inspector_html(envelope, str(node.get("name")))
                         inspector_path.write_text(inspector_html, encoding="utf-8")
                         inspector_href = inspector_path.resolve().as_uri()
+                        latest_inspector = _write_latest_preview_alias(
+                            inspector_path,
+                            previews_dir,
+                            f"latest_{node_slug}_inspector.html",
+                        )
+                        if latest_inspector is not None:
+                            inspector_latest_href = latest_inspector.resolve().as_uri()
                 except Exception:
                     inspector_href = None
+                    inspector_latest_href = None
         for idx, artifact in enumerate(node.get("output_artifacts", []) or []):
             abs_path = str(artifact.get("abs_path") or "").strip()
             fmt = str(artifact.get("format") or "")
+            key_slug = _slugify(str(artifact.get("key") or f"artifact_{idx}"))
             link = {
                 "key": artifact.get("key"),
                 "format": fmt,
@@ -418,6 +439,7 @@ def _build_enriched_manifest(manifest: Dict[str, Any], output_dir: Path, include
                 "abs_path": abs_path,
                 "open_href": None,
                 "preview_href": None,
+                "preview_latest_href": None,
             }
             if abs_path:
                 p = Path(abs_path)
@@ -430,6 +452,13 @@ def _build_enriched_manifest(manifest: Dict[str, Any], output_dir: Path, include
                             preview_path = previews_dir / preview_name
                             _write_preview_html(preview_path, str(node.get("name")), artifact, preview_data)
                             link["preview_href"] = preview_path.resolve().as_uri()
+                            latest_preview = _write_latest_preview_alias(
+                                preview_path,
+                                previews_dir,
+                                f"latest_{node_slug}_{key_slug}.html",
+                            )
+                            if latest_preview is not None:
+                                link["preview_latest_href"] = latest_preview.resolve().as_uri()
             artifact_links.append(link)
 
         node["artifact_links"] = artifact_links
@@ -443,6 +472,7 @@ def _build_enriched_manifest(manifest: Dict[str, Any], output_dir: Path, include
             node["primary_preview_href"] = None
             node["primary_artifact_key"] = None
         node["inspector_href"] = inspector_href
+        node["inspector_latest_href"] = inspector_latest_href
         if inspector_href and not node.get("primary_preview_href"):
             node["primary_preview_href"] = inspector_href
     return data
@@ -783,7 +813,7 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
       </details>
     </div>
   </div>
-  <div class="card">
+  <div class="card" id="dagCard">
     <svg id="dagSvg" viewBox="0 0 1800 900" width="100%" height="780" role="img"></svg>
   </div>
   <div class="card">
@@ -1000,8 +1030,15 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
           Outputs: <b>${{links.length}}</b>
         </div>
       `;
-      if (node.inspector_href) {{
-        html += `<div class="artifact-actions" style="margin-bottom:8px;"><a href="${{escapeHtml(node.inspector_href)}}" target="_blank" rel="noopener noreferrer">Open Inspector</a></div>`;
+      if (node.inspector_href || node.inspector_latest_href) {{
+        html += `<div class="artifact-actions" style="margin-bottom:8px;">`;
+        if (node.inspector_href) {{
+          html += `<a href="${{escapeHtml(node.inspector_href)}}" target="_blank" rel="noopener noreferrer">Open Inspector (Run)</a>`;
+        }}
+        if (node.inspector_latest_href) {{
+          html += `<a href="${{escapeHtml(node.inspector_latest_href)}}" target="_blank" rel="noopener noreferrer">Open Inspector (Latest)</a>`;
+        }}
+        html += `</div>`;
       }}
       if (!links.length) {{
         html += `<div class="artifact-item">No output artifacts available for this node.</div>`;
@@ -1018,7 +1055,8 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
               <div style="margin-top:4px;color:#94a3b8;">${{escapeHtml(a.path || a.abs_path || 'n/a')}}</div>
               <div class="artifact-actions" style="margin-top:6px;">
                 ${{a.open_href ? `<a href="${{escapeHtml(a.open_href)}}" target="_blank" rel="noopener noreferrer">Open</a>` : ''}}
-                ${{a.preview_href ? `<a href="${{escapeHtml(a.preview_href)}}" target="_blank" rel="noopener noreferrer">Preview</a>` : ''}}
+                ${{a.preview_href ? `<a href="${{escapeHtml(a.preview_href)}}" target="_blank" rel="noopener noreferrer">Preview (Run)</a>` : ''}}
+                ${{a.preview_latest_href ? `<a href="${{escapeHtml(a.preview_latest_href)}}" target="_blank" rel="noopener noreferrer">Preview (Latest)</a>` : ''}}
               </div>
             </div>
           `;
@@ -1108,6 +1146,57 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
         if (e.sections && e.sections.length) edgeSections.set(e.id, e.sections[0]);
       }});
       return {{ width: Number(out.width || 1600), height: Number(out.height || 900), positions: pos, edgeSections }};
+    }}
+
+    /** Left-to-right layered layout when ELK CDN is unavailable (offline / file:// / blocked unpkg). */
+    function fallbackLayeredLayout(nodes, edges, dims, layoutSettings) {{
+      const names = new Set(nodes.map((n) => n.name));
+      const preds = new Map();
+      nodes.forEach((n) => preds.set(n.name, []));
+      edges.forEach((e) => {{
+        if (names.has(e.source) && names.has(e.target)) preds.get(e.target).push(e.source);
+      }});
+      const memo = new Map();
+      function layerOf(name) {{
+        if (memo.has(name)) return memo.get(name);
+        const ps = preds.get(name) || [];
+        let L = 0;
+        for (const p of ps) L = Math.max(L, layerOf(p) + 1);
+        memo.set(name, L);
+        return L;
+      }}
+      nodes.forEach((n) => layerOf(n.name));
+      const maxLayer = nodes.reduce((m, n) => Math.max(m, memo.get(n.name)), 0);
+      const buckets = new Map();
+      for (let L = 0; L <= maxLayer; L += 1) buckets.set(L, []);
+      nodes.forEach((n) => buckets.get(memo.get(n.name)).push(n.name));
+
+      const hGap = Number(layoutSettings.layer_spacing || 120);
+      const vGap = Number(layoutSettings.node_spacing || 55) + 14;
+      const leftPad = 80;
+      const topPad = 50;
+      let maxRight = leftPad;
+      let maxBottom = topPad;
+      const positions = new Map();
+      for (let L = 0; L <= maxLayer; L += 1) {{
+        const row = buckets.get(L) || [];
+        let yCursor = topPad;
+        row.forEach((name) => {{
+          const d = dims.get(name) || {{ w: 200, h: 62 }};
+          const cx = leftPad + L * hGap + d.w / 2;
+          const cy = yCursor + d.h / 2;
+          yCursor += d.h + vGap;
+          positions.set(name, {{ x: cx, y: cy, w: d.w, h: d.h }});
+          maxRight = Math.max(maxRight, cx + d.w / 2);
+          maxBottom = Math.max(maxBottom, cy + d.h / 2);
+        }});
+      }}
+      return {{
+        width: Math.max(400, maxRight + leftPad),
+        height: Math.max(300, maxBottom + topPad),
+        positions,
+        edgeSections: new Map(),
+      }};
     }}
 
     function renderDag(layout, nodes, edges, dims) {{
@@ -1442,15 +1531,30 @@ def render_html_report(manifest: Dict[str, Any], output_path: Path) -> None:
 
     (async function initDag() {{
       initConfigUi();
+      const dagCard = document.getElementById('dagCard');
+      if (!manifestNodes || manifestNodes.length === 0) {{
+        if (dagCard) {{
+          dagCard.innerHTML = '<p style="padding:12px;color:#94a3b8;">No pipeline nodes in this report.</p>';
+        }}
+        return;
+      }}
       const dims = buildDims(manifestNodes);
+      let layout = null;
+      if (window.ELK) {{
+        try {{
+          layout = await elkLayout(manifestNodes, manifestEdges, dims, manifestLayout);
+        }} catch (e) {{
+          layout = null;
+        }}
+      }}
+      if (!layout) {{
+        layout = fallbackLayeredLayout(manifestNodes, manifestEdges, dims, manifestLayout);
+      }}
       try {{
-        const layout = await elkLayout(manifestNodes, manifestEdges, dims, manifestLayout);
-        if (!layout) throw new Error('ELK layout unavailable');
         renderDag(layout, manifestNodes, manifestEdges, dims);
       }} catch (err) {{
-        const card = document.querySelector('.card');
-        if (card) {{
-          card.innerHTML = `<div style="padding:16px;color:#fca5a5;">Failed to initialize ELK DAG layout. Please check network access for elkjs bundle.</div>`;
+        if (dagCard) {{
+          dagCard.innerHTML = `<div style="padding:16px;color:#fca5a5;">DAG render error: ${{String(err && err.message ? err.message : err)}}</div>`;
         }}
       }}
     }})();

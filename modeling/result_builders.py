@@ -139,7 +139,7 @@ def _ensure_html_document(title: str, html_fragment: str) -> str:
     return build_html_document(
         title=title,
         body_html=fragment,
-        extra_css=".section { margin-top: 14px; }",
+        extra_css=".section { margin-top: 14px; }\n.section + .section { margin-top: 8px; }",
     )
 
 

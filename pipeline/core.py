@@ -211,6 +211,38 @@ class ResearchPipeline:
             "cache_file_bytes": cache_path.stat().st_size if cache_path.exists() else None,
         }
 
+    def _hydrate_node_io_for_report(self, config: Dict[str, Any], node_name: str) -> Dict[str, Any]:
+        """Build manifest I/O from on-disk cache paths + ``artifacts/`` scan (no ``cache.json`` parse)."""
+        cache_key = self.get_node_cache_key(config, node_name)
+        info = self._cache_file_info(node_name, cache_key)
+        artifacts_dir = self.get_artifacts_dir(node_name, cache_key)
+        output_artifacts: List[Dict[str, Any]] = []
+        cache_root = self.cache_dir.resolve()
+        if artifacts_dir.exists():
+            for p in sorted(artifacts_dir.rglob("*")):
+                if not p.is_file():
+                    continue
+                try:
+                    rel = p.resolve().relative_to(cache_root)
+                except ValueError:
+                    continue
+                rel_s = rel.as_posix()
+                fmt = p.suffix.lstrip(".").lower() or "bin"
+                ptr = {"__artifact__": True, "path": rel_s, "key": self._sanitize_key(p.stem), "format": fmt}
+                output_artifacts.append(self._artifact_info(ptr, io_role="output"))
+        output_total: Optional[int]
+        if output_artifacts:
+            output_total = sum(int(a.get("bytes") or 0) for a in output_artifacts)
+        else:
+            output_total = None
+        return {
+            "input_artifacts": [],
+            "output_artifacts": output_artifacts,
+            "input_total_bytes": 0,
+            "output_total_bytes": output_total,
+            **info,
+        }
+
     def _is_typed_envelope(self, payload: Any) -> bool:
         return isinstance(payload, dict) and "status" in payload and "summary" in payload and "outputs" in payload
 
@@ -459,7 +491,75 @@ class ResearchPipeline:
         self._last_report_paths = written
         if written:
             self.logger.info(f"[REPORT] Wrote pipeline report artifacts: {written}")
-    
+
+    def _emit_pipeline_report_idle(
+        self,
+        config: Dict[str, Any],
+        original_materialize: Union[str, Sequence[str]],
+        outputs: List[str],
+        run_started: float,
+        run_status: str = "completed",
+        error_message: Optional[str] = None,
+    ) -> None:
+        """When no subgraph ran, still write a DAG over all registered nodes (HTML graph was empty otherwise)."""
+        report_nodes = set(self.nodes.keys())
+        report_plan = self.determine_execution_plan(config, report_nodes) if report_nodes else {}
+        self._run_context["reason_map"] = {
+            n: self.get_execution_reason(n, config, report_plan) for n in report_nodes
+        }
+        # Populate I/O + timings so the report table and artifact links are not blank (e.g. cox_model).
+        self._last_node_timings = {}
+        self._run_node_io = {}
+        for n in report_nodes:
+            reason = self._run_context["reason_map"].get(n)
+            if report_plan.get(n) == "CACHED":
+                try:
+                    self._run_node_io[n] = self._hydrate_node_io_for_report(config, n)
+                    self._last_node_timings[n] = {
+                        "status": "cached",
+                        "elapsed_s": 0.0,
+                        "reason": reason,
+                    }
+                except Exception:
+                    cache_key = self.get_node_cache_key(config, n)
+                    self._run_node_io[n] = {
+                        "input_artifacts": [],
+                        "output_artifacts": [],
+                        "input_total_bytes": 0,
+                        "output_total_bytes": None,
+                        **self._cache_file_info(n, cache_key),
+                    }
+                    self._last_node_timings[n] = {
+                        "status": "unknown",
+                        "elapsed_s": 0.0,
+                        "reason": reason,
+                    }
+            else:
+                cache_key = self.get_node_cache_key(config, n)
+                self._run_node_io[n] = {
+                    "input_artifacts": [],
+                    "output_artifacts": [],
+                    "input_total_bytes": None,
+                    "output_total_bytes": None,
+                    **self._cache_file_info(n, cache_key),
+                }
+                self._last_node_timings[n] = {
+                    "status": "unknown",
+                    "elapsed_s": 0.0,
+                    "reason": reason,
+                }
+
+        self._emit_pipeline_report(
+            config=config,
+            original_materialize=original_materialize,
+            outputs=outputs,
+            required=report_nodes,
+            execution_plan=report_plan,
+            run_status=run_status,
+            error_message=error_message,
+            elapsed_s=time.time() - run_started,
+        )
+
     def _mark_recent(self, node_name: str, cache_key: str):
         """Mark a cache key as recently used with bounded LRU"""
         token = f"{node_name}_{cache_key}"
@@ -1479,27 +1579,19 @@ body > div {{
             if not outputs:
                 if isinstance(original_materialize, (list, tuple, set)) and len(original_materialize) > 0:
                     self.logger.info("\n[OPTIMIZATION] No valid materialize targets resolved → no work")
-                    self._emit_pipeline_report(
+                    self._emit_pipeline_report_idle(
                         config=config,
                         original_materialize=original_materialize,
                         outputs=[],
-                        required=set(),
-                        execution_plan={},
-                        run_status="completed",
-                        error_message=None,
-                        elapsed_s=time.time() - run_started,
+                        run_started=run_started,
                     )
                     return {}
                 self.logger.info("\n[OPTIMIZATION] No outputs requested and all default outputs are cached → no work")
-                self._emit_pipeline_report(
+                self._emit_pipeline_report_idle(
                     config=config,
                     original_materialize=original_materialize,
                     outputs=[],
-                    required=set(),
-                    execution_plan={},
-                    run_status="completed",
-                    error_message=None,
-                    elapsed_s=time.time() - run_started,
+                    run_started=run_started,
                 )
                 return {}
             required = self._required_nodes(outputs)
@@ -2076,7 +2168,7 @@ body > div {{
     <style>
         """ + get_shared_html_css() + """
         h1, h2, h3 { margin-bottom: 8px; }
-        table, .simpletable { margin-bottom: 20px; font-size: 11px; }
+        table, table.dataframe, .simpletable { margin-bottom: 20px; font-size: 11px; }
         th { position: sticky; top: 0; z-index: 10; }
     </style>
 </head>

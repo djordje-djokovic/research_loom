@@ -98,6 +98,17 @@ def test_pipeline_report_outputs_and_retention(tmp_path):
     assert all(isinstance(node.get("refreshed"), bool) for node in latest_json["nodes"])
     assert any(isinstance(node.get("artifact_links"), list) for node in latest_json["nodes"])
 
+    previews_dir = report_dir / "previews"
+    assert (previews_dir / "latest_source_inspector.html").exists()
+    assert (previews_dir / "latest_sink_inspector.html").exists()
+    assert (previews_dir / "latest_source_items.html").exists()
+    assert (previews_dir / "latest_sink_n.html").exists()
+
+    sink_node = next(node for node in latest_json["nodes"] if node.get("name") == "sink")
+    assert sink_node.get("inspector_latest_href")
+    sink_links = sink_node.get("artifact_links") or []
+    assert sink_links and sink_links[0].get("preview_latest_href")
+
 
 def test_cli_pipeline_report_overrides():
     cfg = _strict_cfg()
